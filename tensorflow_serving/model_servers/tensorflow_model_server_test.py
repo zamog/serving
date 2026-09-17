@@ -435,6 +435,61 @@ class TensorflowModelServerTest(
         expected_version=self._GetModelVersion(
             self._GetSavedModelHalfPlusThreePath()))
 
+  def testGoodGrpcSyncServerOptions(self):
+    """Test server starts with gRPC sync server options specified."""
+    # 2 completion queues x 4 min pollers reserves 8 threads, so pin
+    # grpc_max_threads rather than depend on the test runner's CPU count.
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        grpc_max_threads=32,
+        grpc_num_completion_queues=2,
+        grpc_min_pollers=4,
+        grpc_max_pollers=8)[1]
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=self._GetModelVersion(
+            self._GetSavedModelHalfPlusThreePath()))
+
+  def testBadGrpcPollerRange(self):
+    """Test server fails when grpc_min_pollers exceeds grpc_max_pollers."""
+    proc = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        grpc_min_pollers=16,
+        grpc_max_pollers=8,
+        pipe=subprocess.PIPE,
+        wait_for_server_ready=False)[0]
+
+    error_message = (
+        'server_options.grpc_min_pollers (16) must not be greater than '
+        'server_options.grpc_max_pollers (8)')
+    error_message = error_message.encode('utf-8')
+    self.assertNotEqual(proc.stderr, None)
+    self.assertGreater(proc.stderr.read().find(error_message), -1)
+
+  def testBadGrpcPollerThreadReservation(self):
+    """Test server fails when reserved pollers exceed grpc_max_threads."""
+    proc = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        grpc_max_threads=8,
+        grpc_num_completion_queues=4,
+        grpc_min_pollers=4,
+        grpc_max_pollers=8,
+        pipe=subprocess.PIPE,
+        wait_for_server_ready=False)[0]
+
+    error_message = (
+        'server_options.grpc_num_completion_queues (4) * '
+        'server_options.grpc_min_pollers (4) = 16 polling threads, which '
+        'exceeds server_options.grpc_max_threads (8)')
+    error_message = error_message.encode('utf-8')
+    self.assertNotEqual(proc.stderr, None)
+    self.assertGreater(proc.stderr.read().find(error_message), -1)
+
   def testClassifyREST(self):
     """Test Classify implementation over REST API."""
     model_path = self._GetSavedModelBundlePath()

@@ -44,6 +44,11 @@ class Server {
     tensorflow::string grpc_channel_arguments;
     tensorflow::string grpc_socket_path;
     tensorflow::int32 grpc_max_threads = 4.0 * port::NumSchedulableCPUs();
+    // Tuning knobs for gRPC's synchronous server. Zero means "leave gRPC's own
+    // default in place", so that unset flags do not change server behavior.
+    tensorflow::int32 grpc_num_completion_queues = 0;
+    tensorflow::int32 grpc_min_pollers = 0;
+    tensorflow::int32 grpc_max_pollers = 0;
 
     //
     // HTTP Server options.
