@@ -242,6 +242,23 @@ int main(int argc, char** argv) {
                        "grpc.max_connection_age_ms=2000)"),
       tensorflow::Flag("grpc_max_threads", &options.grpc_max_threads,
                        "Max grpc server threads to handle grpc messages."),
+      tensorflow::Flag("grpc_num_completion_queues",
+                       &options.grpc_num_completion_queues,
+                       "Number of completion queues used by the grpc sync "
+                       "server. If zero, the grpc default (1) is used. Each "
+                       "completion queue reserves grpc_min_pollers threads "
+                       "from grpc_max_threads."),
+      tensorflow::Flag("grpc_min_pollers", &options.grpc_min_pollers,
+                       "Minimum number of polling threads the grpc sync "
+                       "server keeps per completion queue. Raising it avoids "
+                       "creating and destroying a thread per request under "
+                       "load, but grpc_max_pollers must be raised with it. If "
+                       "zero, the grpc default (1) is used."),
+      tensorflow::Flag("grpc_max_pollers", &options.grpc_max_pollers,
+                       "Maximum number of polling threads the grpc sync "
+                       "server keeps per completion queue. Must not be less "
+                       "than grpc_min_pollers. If zero, the grpc default (2) "
+                       "is used."),
       tensorflow::Flag("enable_model_warmup", &options.enable_model_warmup,
                        "Enables model warmup, which triggers lazy "
                        "initializations (such as TF optimizations) at load "

@@ -90,6 +90,13 @@ ModelServerConfig BuildSingleModelConfig(const string& model_name,
 }
 
 
+// Values gRPC's synchronous server uses when the corresponding
+// SyncServerOption is left unset. Mirrored here so that a partially specified
+// set of flags can be validated against what gRPC will actually run with.
+constexpr int kDefaultGrpcNumCompletionQueues = 1;
+constexpr int kDefaultGrpcMinPollers = 1;
+constexpr int kDefaultGrpcMaxPollers = 2;
+
 // gRPC Channel Arguments to be passed from command line to gRPC ServerBuilder.
 struct GrpcChannelArgument {
   string key;
@@ -185,6 +192,61 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
     return errors::InvalidArgument(
       "At least one of server_options.grpc_port or "
       "server_options.grpc_socket_path must be set.");
+  }
+
+  if (server_options.grpc_num_completion_queues < 0 ||
+      server_options.grpc_min_pollers < 0 ||
+      server_options.grpc_max_pollers < 0) {
+    return errors::InvalidArgument(
+        "server_options.grpc_num_completion_queues (",
+        server_options.grpc_num_completion_queues,
+        "), server_options.grpc_min_pollers (", server_options.grpc_min_pollers,
+        ") and server_options.grpc_max_pollers (",
+        server_options.grpc_max_pollers, ") must not be negative.");
+  }
+
+  // Options left at zero are not passed to gRPC, which then applies its own
+  // defaults. Validate against those effective values: a partially specified
+  // set of flags is exactly what produces the surprising configurations below.
+  const int effective_num_completion_queues =
+      server_options.grpc_num_completion_queues > 0
+          ? server_options.grpc_num_completion_queues
+          : kDefaultGrpcNumCompletionQueues;
+  const int effective_min_pollers = server_options.grpc_min_pollers > 0
+                                        ? server_options.grpc_min_pollers
+                                        : kDefaultGrpcMinPollers;
+  const int effective_max_pollers = server_options.grpc_max_pollers > 0
+                                        ? server_options.grpc_max_pollers
+                                        : kDefaultGrpcMaxPollers;
+
+  if (effective_min_pollers > effective_max_pollers) {
+    return errors::InvalidArgument(
+        "server_options.grpc_min_pollers (", effective_min_pollers,
+        ") must not be greater than server_options.grpc_max_pollers (",
+        effective_max_pollers, "). gRPC defaults to ", kDefaultGrpcMaxPollers,
+        " max pollers, so raising the minimum on its own leaves the server "
+        "destroying threads faster than the default configuration does; set "
+        "grpc_max_pollers as well.");
+  }
+
+  // Every completion queue gets its own gRPC ThreadManager, and each one
+  // reserves min_pollers threads from the server's shared thread quota before
+  // it starts polling. gRPC core aborts the process when that reservation
+  // fails, so reject the configuration here rather than let the server die at
+  // startup with a bare gRPC message.
+  const int64_t reserved_poller_threads =
+      static_cast<int64_t>(effective_num_completion_queues) *
+      effective_min_pollers;
+  if (reserved_poller_threads > server_options.grpc_max_threads) {
+    return errors::InvalidArgument(
+        "server_options.grpc_num_completion_queues (",
+        effective_num_completion_queues,
+        ") * server_options.grpc_min_pollers (", effective_min_pollers, ") = ",
+        reserved_poller_threads,
+        " polling threads, which exceeds server_options.grpc_max_threads (",
+        server_options.grpc_max_threads,
+        "). gRPC reserves these threads from the server's thread quota up "
+        "front and aborts the process if the reservation fails.");
   }
 
   if (server_options.use_alts_credentials &&
@@ -406,6 +468,38 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
       builder.AddChannelArgument(channel_argument.key, value);
     } else {
       builder.AddChannelArgument(channel_argument.key, channel_argument.value);
+    }
+  }
+
+  // gRPC's synchronous server runs with a single completion queue and a
+  // MIN_POLLERS/MAX_POLLERS band of 1/2 by default. Its ThreadManager starts a
+  // new thread whenever the last poller picks up a call, and lets a thread exit
+  // once its handler returns, so under concurrent load the server creates and
+  // destroys a thread for a large fraction of requests. That thread creation
+  // sits on the dispatch path (no call is polled for until the new thread
+  // runs), and the stack mmap/munmap and clone/exit traffic it generates
+  // contends for process- and host-wide kernel locks. Widening the poller band
+  // and adding completion queues keeps a stable pool of polling threads
+  // instead. Each option is applied only when explicitly set, so the defaults
+  // leave gRPC's behavior unchanged. The pool is not free: gRPC reserves
+  // num_completion_queues * min_pollers threads from the ResourceQuota set
+  // below, and grpc_max_threads must leave room for both those pollers and the
+  // request handlers; BuildAndStart validates that precondition above. See
+  // https://github.com/tensorflow/serving/issues/2141.
+  const std::pair<::grpc::ServerBuilder::SyncServerOption, int>
+      sync_server_options[] = {
+          {::grpc::ServerBuilder::SyncServerOption::NUM_CQS,
+           server_options.grpc_num_completion_queues},
+          {::grpc::ServerBuilder::SyncServerOption::MIN_POLLERS,
+           server_options.grpc_min_pollers},
+          {::grpc::ServerBuilder::SyncServerOption::MAX_POLLERS,
+           server_options.grpc_max_pollers},
+      };
+  for (const auto& sync_server_option : sync_server_options) {
+    // Zero means "leave the gRPC default in place".
+    if (sync_server_option.second > 0) {
+      builder.SetSyncServerOption(sync_server_option.first,
+                                  sync_server_option.second);
     }
   }
 

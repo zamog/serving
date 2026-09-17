@@ -145,6 +145,10 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       monitoring_config_file=None,
       batching_parameters_file=None,
       grpc_channel_arguments='',
+      grpc_max_threads=None,
+      grpc_num_completion_queues=None,
+      grpc_min_pollers=None,
+      grpc_max_pollers=None,
       wait_for_server_ready=True,
       pipe=None,
       model_config_file_poll_period=None,
@@ -164,6 +168,10 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       monitoring_config_file: Path to the monitoring config file.
       batching_parameters_file: Path to batching parameters.
       grpc_channel_arguments: Custom gRPC args for server.
+      grpc_max_threads: Max gRPC server threads.
+      grpc_num_completion_queues: Number of gRPC sync server completion queues.
+      grpc_min_pollers: Minimum number of gRPC sync server polling threads.
+      grpc_max_pollers: Maximum number of gRPC sync server polling threads.
       wait_for_server_ready: Wait for gRPC port to be ready.
       pipe: subpipe.PIPE object to read stderr from server.
       model_config_file_poll_period: Period for polling the filesystem to
@@ -218,6 +226,19 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
     if batching_parameters_file:
       command += ' --enable_batching'
       command += ' --batching_parameters_file=' + batching_parameters_file
+
+    if grpc_max_threads is not None:
+      command += ' --grpc_max_threads=' + str(grpc_max_threads)
+
+    if grpc_num_completion_queues is not None:
+      command += ' --grpc_num_completion_queues=' + str(
+          grpc_num_completion_queues)
+
+    if grpc_min_pollers is not None:
+      command += ' --grpc_min_pollers=' + str(grpc_min_pollers)
+
+    if grpc_max_pollers is not None:
+      command += ' --grpc_max_pollers=' + str(grpc_max_pollers)
 
     # Allow port reuse to prevent flakiness with portpicker. This logic cleanly
     # handles merging the reuseaddr flag with any existing gRPC arguments.
