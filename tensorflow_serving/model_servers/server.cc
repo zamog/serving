@@ -416,15 +416,15 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
       server_options.enable_grpc_healthcheck_service);
   grpc_server_ = builder.BuildAndStart();
 
+  if (grpc_server_ == nullptr) {
+    return errors::InvalidArgument("Failed to BuildAndStart gRPC server");
+  }
+
   if (server_options.enable_grpc_healthcheck_service) {
     grpc_server_->GetHealthCheckService()->SetServingStatus("ModelService",
                                                             true);
     grpc_server_->GetHealthCheckService()->SetServingStatus("PredictionService",
                                                             true);
-  }
-
-  if (grpc_server_ == nullptr) {
-    return errors::InvalidArgument("Failed to BuildAndStart gRPC server");
   }
   if (server_options.grpc_port != 0) {
     LOG(INFO) << "Running gRPC ModelServer at " << server_address << " ...";
