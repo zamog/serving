@@ -435,6 +435,18 @@ class TensorflowModelServerTest(
         expected_version=self._GetModelVersion(
             self._GetSavedModelHalfPlusThreePath()))
 
+  def _OsThreadNames(self, proc):
+    """Returns the OS thread name (comm) of every thread of proc."""
+    task_dir = '/proc/{}/task'.format(proc.pid)
+    comms = []
+    for tid in os.listdir(task_dir):
+      try:
+        with open(os.path.join(task_dir, tid, 'comm')) as f:
+          comms.append(f.read().strip())
+      except OSError:
+        pass  # The thread exited while listing.
+    return comms
+
   def testThreadNamesExposedToOs(self):
     """Test TensorFlow threads carry their pool name as the OS thread name."""
     if not sys.platform.startswith('linux'):
@@ -449,18 +461,33 @@ class TensorflowModelServerTest(
         specify_output=False,
         expected_version=self._GetModelVersion(
             self._GetSavedModelHalfPlusThreePath()))
-    task_dir = '/proc/{}/task'.format(proc.pid)
-    comms = []
-    for tid in os.listdir(task_dir):
-      try:
-        with open(os.path.join(task_dir, tid, 'comm')) as f:
-          comms.append(f.read().strip())
-      except IOError:
-        pass  # The thread exited while listing.
-    # TensorFlow prefixes its thread pool names with "tf_" (e.g. tf_Compute).
-    self.assertTrue(
-        any(comm.startswith('tf_') for comm in comms),
-        'no TensorFlow-named thread among: {}'.format(sorted(set(comms))))
+    comms = self._OsThreadNames(proc)
+    # DirectSession's pools are named "Compute", prefixed "tf_" by ThreadPool.
+    self.assertIn('tf_Compute', comms,
+                  'no tf_Compute thread among: {}'.format(sorted(set(comms))))
+
+  def testLongThreadNamesAreTruncatedForOs(self):
+    """Test names longer than the kernel's 15 bytes still reach the OS."""
+    if not sys.platform.startswith('linux'):
+      self.skipTest('OS thread names are only set on Linux')
+    proc, model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        batching_parameters_file=self._GetBatchingParametersFile())[:2]
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=self._GetModelVersion(
+            self._GetSavedModelHalfPlusThreePath()))
+    comms = self._OsThreadNames(proc)
+    # The batch threads are named "model_server_batch_threads_" (27 bytes);
+    # untruncated, pthread_setname_np would fail and leave the thread
+    # unnamed. batching_config.txt sets num_batch_threads to 8.
+    self.assertEqual(
+        comms.count('model_server_ba'), 8,
+        'expected 8 model_server_ba threads among: {}'.format(
+            sorted(set(comms))))
 
   def testGoodGrpcSyncServerOptions(self):
     """Test server starts with gRPC sync server options specified."""
