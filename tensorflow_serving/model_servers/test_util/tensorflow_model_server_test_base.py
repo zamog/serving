@@ -157,6 +157,8 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       grpc_num_completion_queues=None,
       grpc_min_pollers=None,
       grpc_max_pollers=None,
+      tf_thread_slice_ns=None,
+      grpc_thread_slice_ns=None,
       wait_for_server_ready=True,
       pipe=None,
       model_config_file_poll_period=None,
@@ -180,6 +182,8 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       grpc_num_completion_queues: Number of gRPC sync server completion queues.
       grpc_min_pollers: Minimum number of gRPC sync server polling threads.
       grpc_max_pollers: Maximum number of gRPC sync server polling threads.
+      tf_thread_slice_ns: EEVDF slice for the TensorFlow threads.
+      grpc_thread_slice_ns: EEVDF slice for the gRPC threads.
       wait_for_server_ready: Wait for gRPC port to be ready.
       pipe: subpipe.PIPE object to read stderr from server.
       model_config_file_poll_period: Period for polling the filesystem to
@@ -242,6 +246,12 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
 
     if grpc_max_pollers is not None:
       command += ' --grpc_max_pollers=' + str(grpc_max_pollers)
+
+    if tf_thread_slice_ns is not None:
+      command += ' --tf_thread_slice_ns=' + str(tf_thread_slice_ns)
+
+    if grpc_thread_slice_ns is not None:
+      command += ' --grpc_thread_slice_ns=' + str(grpc_thread_slice_ns)
 
     if grpc_channel_arguments:
       command += ' --grpc_channel_arguments=' + grpc_channel_arguments

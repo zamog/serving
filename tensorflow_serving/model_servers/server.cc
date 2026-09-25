@@ -52,6 +52,7 @@ limitations under the License.
 #include "tensorflow_serving/model_servers/model_platform_types.h"
 #include "tensorflow_serving/model_servers/server_core.h"
 #include "tensorflow_serving/model_servers/server_init.h"
+#include "tensorflow_serving/model_servers/thread_sched_slice.h"
 #include "tensorflow_serving/servables/tensorflow/predict_response_tensor_serialization_option.h"
 #include "tensorflow_serving/servables/tensorflow/session_bundle_config.pb.h"
 #include "tensorflow_serving/servables/tensorflow/thread_pool_factory_config.pb.h"
@@ -153,6 +154,21 @@ std::shared_ptr<::grpc::ServerCredentials> BuildServerCredentials(
   return ::grpc::SslServerCredentials(ssl_ops);
 }
 
+void LogThreadSliceMessage(SliceLogSeverity severity,
+                           const std::string& message) {
+  switch (severity) {
+    case SliceLogSeverity::kInfo:
+      LOG(INFO) << message;
+      break;
+    case SliceLogSeverity::kWarning:
+      LOG(WARNING) << message;
+      break;
+    case SliceLogSeverity::kError:
+      LOG(ERROR) << message;
+      break;
+  }
+}
+
 }  // namespace
 
 Server::Options::Options()
@@ -247,6 +263,13 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
         "front and aborts the process if the reservation fails.");
   }
 
+  if (const std::string error =
+          ValidateThreadSliceFlags(server_options.tf_thread_slice_ns,
+                                   server_options.grpc_thread_slice_ns);
+      !error.empty()) {
+    return errors::InvalidArgument(error);
+  }
+
   if (server_options.use_alts_credentials &&
       !server_options.ssl_config_file.empty()) {
     return errors::InvalidArgument(
@@ -263,6 +286,15 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
 
   SetSignatureMethodNameCheckFeature(
       server_options.enable_signature_method_name_check);
+
+  // Every TensorFlow thread (session thread pools, batch threads, GPU event
+  // and stream threads, loader threads) is created below, directly or
+  // indirectly, by this thread, and inherits its scheduler attributes. If the
+  // kernel cannot apply the slices this only logs a warning.
+  ThreadSliceSetter thread_slices(server_options.tf_thread_slice_ns,
+                                  server_options.grpc_thread_slice_ns,
+                                  LogThreadSliceMessage);
+  thread_slices.ApplyTensorFlowSlice();
 
   // For ServerCore Options, we leave servable_state_monitor_creator unspecified
   // so the default servable_state_monitor_creator will be used.
@@ -430,6 +462,12 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
   predict_server_options.thread_pool_factory = thread_pool_factory_.get();
   prediction_service_ =
       tf_serving_registry->GetCreatePredictionService()(predict_server_options);
+
+  // gRPC's ThreadManager threads are created by BuildAndStart() below and by
+  // each other later; they inherit this thread's slice from here on, as do
+  // the HTTP server threads started afterwards. This also moves this thread
+  // off the TensorFlow slice when only tf_thread_slice_ns is set.
+  thread_slices.ApplyGrpcSlice();
 
   ::grpc::ServerBuilder builder;
   // If defined, listen to a tcp port for gRPC/HTTP.

@@ -470,6 +470,57 @@ class TensorflowModelServerTest(
     self.assertNotEqual(proc.stderr, None)
     self.assertGreater(proc.stderr.read().find(error_message), -1)
 
+  def testGoodThreadSlices(self):
+    """Test server starts and serves with EEVDF thread slices set.
+
+    Passes on any kernel: without per-thread slice support (Linux < 6.12) the
+    server logs a warning and starts with the default scheduling.
+    """
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        tf_thread_slice_ns=500000,
+        grpc_thread_slice_ns=4000000)[1]
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=self._GetModelVersion(
+            self._GetSavedModelHalfPlusThreePath()))
+
+  def testBadThreadSliceOrder(self):
+    """Test server fails when the TensorFlow slice exceeds the gRPC slice."""
+    proc = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        tf_thread_slice_ns=4000000,
+        grpc_thread_slice_ns=500000,
+        pipe=subprocess.PIPE,
+        wait_for_server_ready=False)[0]
+
+    error_message = (
+        'server_options.tf_thread_slice_ns (4000000) must not be greater than '
+        'server_options.grpc_thread_slice_ns (500000)')
+    error_message = error_message.encode('utf-8')
+    self.assertNotEqual(proc.stderr, None)
+    self.assertGreater(proc.stderr.read().find(error_message), -1)
+
+  def testBadThreadSliceTooSmall(self):
+    """Test server fails on a slice the kernel would silently clamp."""
+    proc = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        tf_thread_slice_ns=1000,
+        pipe=subprocess.PIPE,
+        wait_for_server_ready=False)[0]
+
+    error_message = (
+        'server_options.tf_thread_slice_ns (1000) must be 0 or between '
+        '100000 and 100000000 ns')
+    error_message = error_message.encode('utf-8')
+    self.assertNotEqual(proc.stderr, None)
+    self.assertGreater(proc.stderr.read().find(error_message), -1)
+
   def testBadGrpcPollerThreadReservation(self):
     """Test server fails when reserved pollers exceed grpc_max_threads."""
     proc = TensorflowModelServerTest.RunServer(

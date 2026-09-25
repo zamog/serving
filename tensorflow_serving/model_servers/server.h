@@ -49,6 +49,13 @@ class Server {
     tensorflow::int32 grpc_num_completion_queues = 0;
     tensorflow::int32 grpc_min_pollers = 0;
     tensorflow::int32 grpc_max_pollers = 0;
+    // EEVDF per-thread CPU slices (Linux >= 6.12). tf_thread_slice_ns is set
+    // on the main thread before the TensorFlow threads are created and
+    // grpc_thread_slice_ns before gRPC's threads are; threads inherit it.
+    // Zero leaves the kernel default. A kernel that cannot apply them only
+    // logs a warning. See thread_sched_slice.h.
+    int64_t tf_thread_slice_ns = 0;
+    int64_t grpc_thread_slice_ns = 0;
 
     //
     // HTTP Server options.

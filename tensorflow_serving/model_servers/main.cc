@@ -259,6 +259,24 @@ int main(int argc, char** argv) {
                        "server keeps per completion queue. Must not be less "
                        "than grpc_min_pollers. If zero, the grpc default (2) "
                        "is used."),
+      tensorflow::Flag("tf_thread_slice_ns", &options.tf_thread_slice_ns,
+                       "Linux >= 6.12 only. EEVDF CPU slice, in nanoseconds, "
+                       "for the TensorFlow threads (session thread pools, "
+                       "batch threads, GPU threads). A shorter slice than "
+                       "other threads on the host schedules them sooner when "
+                       "the CPU is contended. 0 (default) keeps the kernel "
+                       "default; otherwise 100000 to 100000000. On kernels "
+                       "without per-thread slices a warning is logged and the "
+                       "flag has no effect."),
+      tensorflow::Flag("grpc_thread_slice_ns", &options.grpc_thread_slice_ns,
+                       "Linux >= 6.12 only. EEVDF CPU slice, in nanoseconds, "
+                       "for the gRPC request handler threads (and the HTTP "
+                       "server threads). Set it larger than "
+                       "tf_thread_slice_ns so request handling queues behind "
+                       "graph execution under CPU contention. 0 (default) "
+                       "keeps the kernel default; otherwise 100000 to "
+                       "100000000. On kernels without per-thread slices a "
+                       "warning is logged and the flag has no effect."),
       tensorflow::Flag("enable_model_warmup", &options.enable_model_warmup,
                        "Enables model warmup, which triggers lazy "
                        "initializations (such as TF optimizations) at load "

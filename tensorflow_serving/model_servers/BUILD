@@ -474,6 +474,22 @@ cc_library(
 )
 
 cc_library(
+    name = "thread_sched_slice",
+    srcs = ["thread_sched_slice.cc"],
+    hdrs = ["thread_sched_slice.h"],
+)
+
+cc_test(
+    name = "thread_sched_slice_test",
+    size = "small",
+    srcs = ["thread_sched_slice_test.cc"],
+    deps = [
+        ":thread_sched_slice",
+        "//tensorflow_serving/core/test_util:test_main",
+    ],
+)
+
+cc_library(
     name = "server_lib",
     srcs = [
         "server.cc",
@@ -488,6 +504,7 @@ cc_library(
         ":prediction_service_impl",
         ":server_core",
         ":server_init",
+        ":thread_sched_slice",
         "//tensorflow_serving/config:model_server_config_cc_proto",
         "//tensorflow_serving/config:monitoring_config_cc_proto",
         "//tensorflow_serving/config:platform_config_cc_proto",
