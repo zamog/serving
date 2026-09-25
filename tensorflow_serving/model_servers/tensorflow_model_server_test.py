@@ -435,6 +435,33 @@ class TensorflowModelServerTest(
         expected_version=self._GetModelVersion(
             self._GetSavedModelHalfPlusThreePath()))
 
+  def testThreadNamesExposedToOs(self):
+    """Test TensorFlow threads carry their pool name as the OS thread name."""
+    if not sys.platform.startswith('linux'):
+      self.skipTest('OS thread names are only set on Linux')
+    proc, model_server_address = TensorflowModelServerTest.RunServer(
+        'default', self._GetSavedModelBundlePath())[:2]
+    # Serving a request guarantees the model, and with it TensorFlow's
+    # session thread pools, has been loaded.
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=self._GetModelVersion(
+            self._GetSavedModelHalfPlusThreePath()))
+    task_dir = '/proc/{}/task'.format(proc.pid)
+    comms = []
+    for tid in os.listdir(task_dir):
+      try:
+        with open(os.path.join(task_dir, tid, 'comm')) as f:
+          comms.append(f.read().strip())
+      except IOError:
+        pass  # The thread exited while listing.
+    # TensorFlow prefixes its thread pool names with "tf_" (e.g. tf_Compute).
+    self.assertTrue(
+        any(comm.startswith('tf_') for comm in comms),
+        'no TensorFlow-named thread among: {}'.format(sorted(set(comms))))
+
   def testGoodGrpcSyncServerOptions(self):
     """Test server starts with gRPC sync server options specified."""
     # 2 completion queues x 4 min pollers reserves 8 threads, so pin

@@ -66,3 +66,23 @@ index ad4c9a4e22a..331ca1becf8 100644
    AllocationValue(const HloValue* value, const HloPosition& position,
                    int64_t size)
        : value_(value),
+diff --git a/third_party/xla/xla/tsl/platform/default/env.cc b/third_party/xla/xla/tsl/platform/default/env.cc
+--- a/third_party/xla/xla/tsl/platform/default/env.cc
++++ b/third_party/xla/xla/tsl/platform/default/env.cc
+@@ -88,6 +88,16 @@ class PThread : public Thread {
+   static void* ThreadFn(void* params_arg) {
+     std::unique_ptr<ThreadParams> params(
+         reinterpret_cast<ThreadParams*>(params_arg));
++#if defined(__linux__)
++    // Expose the name to the OS (perf, top, /proc/<pid>/task/*/comm and
++    // external scheduling policies). The kernel keeps 15 bytes plus NUL and
++    // pthread_setname_np fails with ERANGE on anything longer, so truncate.
++    // Naming the calling thread is a prctl(), not a /proc write, and happens
++    // before fn runs. Best effort: failure only leaves the inherited name.
++    if (!params->name.empty()) {
++      pthread_setname_np(pthread_self(), params->name.substr(0, 15).c_str());
++    }
++#endif
+     {
+       mutex_lock l(name_mutex);
+       GetThreadNameRegistry().emplace(std::this_thread::get_id(), params->name);
