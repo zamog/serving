@@ -263,12 +263,8 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
         "front and aborts the process if the reservation fails.");
   }
 
-  if (const std::string error =
-          ValidateThreadSliceFlags(server_options.tf_thread_slice_ns,
-                                   server_options.grpc_thread_slice_ns);
-      !error.empty()) {
-    return errors::InvalidArgument(error);
-  }
+  TF_RETURN_IF_ERROR(ValidateThreadSliceFlags(
+      server_options.tf_thread_slice_ns, server_options.grpc_thread_slice_ns));
 
   if (server_options.use_alts_credentials &&
       !server_options.ssl_config_file.empty()) {

@@ -20,6 +20,9 @@ limitations under the License.
 #include <functional>
 #include <string>
 
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+
 namespace tensorflow {
 namespace serving {
 
@@ -32,8 +35,8 @@ namespace serving {
 
 // The kernel clamps slices to this range; values outside it are rejected so
 // that the effective slice can be verified to equal the requested one.
-inline constexpr int64_t kMinThreadSliceNs = 100 * 1000;          // 0.1 ms
-inline constexpr int64_t kMaxThreadSliceNs = 100 * 1000 * 1000;   // 100 ms
+inline constexpr int64_t kMinThreadSliceNs = 100 * 1000;         // 0.1 ms
+inline constexpr int64_t kMaxThreadSliceNs = 100 * 1000 * 1000;  // 100 ms
 
 // The kernel's struct sched_attr, first version (SCHED_ATTR_SIZE_VER0).
 // glibc 2.31 (the serving base image) has neither the struct nor a wrapper.
@@ -60,11 +63,10 @@ struct SchedAttrSyscalls {
 // The real syscalls; on non-Linux builds both return ENOSYS.
 SchedAttrSyscalls LinuxSchedAttrSyscalls();
 
-// Returns an empty string if the flag pair is valid, else the reason. Only
-// the values are checked, not the kernel: an invalid pair fails the same way
-// on every host.
-std::string ValidateThreadSliceFlags(int64_t tf_thread_slice_ns,
-                                     int64_t grpc_thread_slice_ns);
+// Returns InvalidArgument if the flag pair is invalid. Only the values are
+// checked, not the kernel: an invalid pair fails the same way on every host.
+absl::Status ValidateThreadSliceFlags(int64_t tf_thread_slice_ns,
+                                      int64_t grpc_thread_slice_ns);
 
 enum class SliceLogSeverity { kInfo, kWarning, kError };
 using SliceLogger =
@@ -107,10 +109,10 @@ class ThreadSliceSetter final {
   // can work here. Changes nothing.
   bool Probe();
   // Sets the calling thread's slice (0 = kernel default) keeping its policy
-  // and nice value, then verifies it. Returns an empty string on success,
-  // else the reason; *effective_ns receives the slice read back.
-  std::string SetSlice(int64_t slice_ns, uint64_t* effective_ns);
-  void Disable(const std::string& reason);
+  // and nice value, then verifies it; *effective_ns receives the slice read
+  // back.
+  absl::Status SetSlice(int64_t slice_ns, uint64_t* effective_ns);
+  void Disable(absl::string_view reason);
 
   const int64_t tf_thread_slice_ns_;
   const int64_t grpc_thread_slice_ns_;

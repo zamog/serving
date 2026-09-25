@@ -20,8 +20,10 @@ limitations under the License.
 #include <string>
 #include <utility>
 
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+
 #if defined(__linux__)
-#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -38,15 +40,14 @@ constexpr uint64_t kSchedFlagResetOnFork = 0x01;
 constexpr uint32_t kSchedAttrSizeVer0 = 48;
 
 std::string ErrnoText(int error) {
-  return std::string(std::strerror(error)) + " (errno " +
-         std::to_string(error) + ")";
+  return absl::StrCat(std::strerror(error), " (errno ", error, ")");
 }
 
-std::string SliceFlagRangeError(const char* name, int64_t value) {
-  return std::string("server_options.") + name + " (" + std::to_string(value) +
-         ") must be 0 or between " + std::to_string(kMinThreadSliceNs) +
-         " and " + std::to_string(kMaxThreadSliceNs) +
-         " ns; the kernel clamps slices outside that range.";
+absl::Status SliceFlagRangeError(const char* name, int64_t value) {
+  return absl::InvalidArgumentError(absl::StrCat(
+      "server_options.", name, " (", value, ") must be 0 or between ",
+      kMinThreadSliceNs, " and ", kMaxThreadSliceNs,
+      " ns; the kernel clamps slices outside that range."));
 }
 
 }  // namespace
@@ -70,13 +71,13 @@ SchedAttrSyscalls LinuxSchedAttrSyscalls() {
 #endif
 }
 
-std::string ValidateThreadSliceFlags(int64_t tf_thread_slice_ns,
-                                     int64_t grpc_thread_slice_ns) {
+absl::Status ValidateThreadSliceFlags(int64_t tf_thread_slice_ns,
+                                      int64_t grpc_thread_slice_ns) {
   if (tf_thread_slice_ns < 0 || grpc_thread_slice_ns < 0) {
-    return "server_options.tf_thread_slice_ns (" +
-           std::to_string(tf_thread_slice_ns) +
-           ") and server_options.grpc_thread_slice_ns (" +
-           std::to_string(grpc_thread_slice_ns) + ") must not be negative.";
+    return absl::InvalidArgumentError(
+        absl::StrCat("server_options.tf_thread_slice_ns (", tf_thread_slice_ns,
+                     ") and server_options.grpc_thread_slice_ns (",
+                     grpc_thread_slice_ns, ") must not be negative."));
   }
   const auto out_of_range = [](int64_t value) {
     return value != 0 &&
@@ -90,14 +91,14 @@ std::string ValidateThreadSliceFlags(int64_t tf_thread_slice_ns,
   }
   if (tf_thread_slice_ns != 0 && grpc_thread_slice_ns != 0 &&
       tf_thread_slice_ns > grpc_thread_slice_ns) {
-    return "server_options.tf_thread_slice_ns (" +
-           std::to_string(tf_thread_slice_ns) +
-           ") must not be greater than server_options.grpc_thread_slice_ns (" +
-           std::to_string(grpc_thread_slice_ns) +
-           "): a shorter slice means earlier scheduling, and the TensorFlow "
-           "threads are the ones that determine graph run time.";
+    return absl::InvalidArgumentError(absl::StrCat(
+        "server_options.tf_thread_slice_ns (", tf_thread_slice_ns,
+        ") must not be greater than server_options.grpc_thread_slice_ns (",
+        grpc_thread_slice_ns,
+        "): a shorter slice means earlier scheduling, and the TensorFlow "
+        "threads are the ones that determine graph run time."));
   }
-  return "";
+  return absl::OkStatus();
 }
 
 ThreadSliceSetter::ThreadSliceSetter(int64_t tf_thread_slice_ns,
@@ -113,27 +114,27 @@ ThreadSliceSetter::ThreadSliceSetter(int64_t tf_thread_slice_ns,
   }
 }
 
-void ThreadSliceSetter::Disable(const std::string& reason) {
+void ThreadSliceSetter::Disable(absl::string_view reason) {
   state_ = State::kDisabled;
   logger_(SliceLogSeverity::kWarning,
-          "Per-thread EEVDF slices disabled: " + reason +
-              ". Starting with the kernel's default scheduling; the "
-              "--tf_thread_slice_ns/--grpc_thread_slice_ns flags have no "
-              "effect.");
+          absl::StrCat("Per-thread EEVDF slices disabled: ", reason,
+                       ". Starting with the kernel's default scheduling; the "
+                       "--tf_thread_slice_ns/--grpc_thread_slice_ns flags "
+                       "have no effect."));
 }
 
 bool ThreadSliceSetter::Probe() {
   if (state_ != State::kUnprobed) return state_ == State::kReady;
   KernelSchedAttr attr;
   if (const int error = syscalls_.get(&attr); error != 0) {
-    Disable("sched_getattr failed: " + ErrnoText(error));
+    Disable(absl::StrCat("sched_getattr failed: ", ErrnoText(error)));
     return false;
   }
   if (attr.sched_policy != kSchedOther && attr.sched_policy != kSchedBatch) {
-    Disable("the server runs under scheduling policy " +
-            std::to_string(attr.sched_policy) +
-            ", and slices apply only to SCHED_OTHER/SCHED_BATCH; the policy "
-            "is left unchanged");
+    Disable(absl::StrCat(
+        "the server runs under scheduling policy ", attr.sched_policy,
+        ", and slices apply only to SCHED_OTHER/SCHED_BATCH; the policy is "
+        "left unchanged"));
     return false;
   }
   if ((attr.sched_flags & kSchedFlagResetOnFork) != 0) {
@@ -154,13 +155,14 @@ bool ThreadSliceSetter::Probe() {
   return true;
 }
 
-std::string ThreadSliceSetter::SetSlice(int64_t slice_ns,
-                                        uint64_t* effective_ns) {
+absl::Status ThreadSliceSetter::SetSlice(int64_t slice_ns,
+                                         uint64_t* effective_ns) {
   // Re-read so that the policy and nice value passed back are current. Flags
   // must stay 0: SCHED_FLAG_KEEP_PARAMS would make the kernel skip the slice.
   KernelSchedAttr attr;
   if (const int error = syscalls_.get(&attr); error != 0) {
-    return "sched_getattr failed: " + ErrnoText(error);
+    return absl::InternalError(
+        absl::StrCat("sched_getattr failed: ", ErrnoText(error)));
   }
   attr.size = kSchedAttrSizeVer0;
   attr.sched_flags = 0;
@@ -169,46 +171,47 @@ std::string ThreadSliceSetter::SetSlice(int64_t slice_ns,
   attr.sched_deadline = 0;
   attr.sched_period = 0;
   if (const int error = syscalls_.set(attr); error != 0) {
-    return "sched_setattr(slice " + std::to_string(slice_ns) +
-           " ns) failed: " + ErrnoText(error);
+    return absl::InternalError(absl::StrCat("sched_setattr(slice ", slice_ns,
+                                            " ns) failed: ", ErrnoText(error)));
   }
   KernelSchedAttr back;
   if (const int error = syscalls_.get(&back); error != 0) {
-    return "sched_getattr failed: " + ErrnoText(error);
+    return absl::InternalError(
+        absl::StrCat("sched_getattr failed: ", ErrnoText(error)));
   }
   *effective_ns = back.sched_runtime;
   // slice_ns == 0 restores the kernel's base slice, whose value is not known
   // here; any non-zero read-back is fine then.
-  const bool matches = slice_ns == 0
-                           ? back.sched_runtime != 0
-                           : back.sched_runtime ==
-                                 static_cast<uint64_t>(slice_ns);
+  const bool matches =
+      slice_ns == 0 ? back.sched_runtime != 0
+                    : back.sched_runtime == static_cast<uint64_t>(slice_ns);
   if (!matches) {
-    return "the kernel reports an effective slice of " +
-           std::to_string(back.sched_runtime) + " ns after a request for " +
-           std::to_string(slice_ns) + " ns";
+    return absl::InternalError(absl::StrCat(
+        "the kernel reports an effective slice of ", back.sched_runtime,
+        " ns after a request for ", slice_ns, " ns"));
   }
-  return "";
+  return absl::OkStatus();
 }
 
 void ThreadSliceSetter::ApplyTensorFlowSlice() {
   if (tf_thread_slice_ns_ == 0 || !Probe()) return;
   uint64_t effective_ns = 0;
-  const std::string error = SetSlice(tf_thread_slice_ns_, &effective_ns);
-  if (!error.empty()) {
+  const absl::Status status = SetSlice(tf_thread_slice_ns_, &effective_ns);
+  if (!status.ok()) {
     // A set that went through but read back wrong may have changed the
     // slice; put the default back before giving up. Failure here is moot:
     // the feature is off and there is nothing more to try.
     uint64_t ignored = 0;
-    SetSlice(0, &ignored);
-    Disable("TensorFlow thread slice not applied: " + error);
+    SetSlice(0, &ignored).IgnoreError();
+    Disable(absl::StrCat("TensorFlow thread slice not applied: ",
+                         status.message()));
     return;
   }
   tf_slice_applied_ = true;
   logger_(SliceLogSeverity::kInfo,
-          "TensorFlow threads: EEVDF slice requested " +
-              std::to_string(tf_thread_slice_ns_) + " ns, effective " +
-              std::to_string(effective_ns) + " ns");
+          absl::StrCat("TensorFlow threads: EEVDF slice requested ",
+                       tf_thread_slice_ns_, " ns, effective ", effective_ns,
+                       " ns"));
 }
 
 void ThreadSliceSetter::ApplyGrpcSlice() {
@@ -217,35 +220,37 @@ void ThreadSliceSetter::ApplyGrpcSlice() {
   if (grpc_thread_slice_ns_ == 0 && !tf_slice_applied_) return;
   if (!Probe()) return;
   uint64_t effective_ns = 0;
-  std::string error = SetSlice(grpc_thread_slice_ns_, &effective_ns);
-  if (error.empty()) {
-    logger_(SliceLogSeverity::kInfo,
-            grpc_thread_slice_ns_ == 0
-                ? "gRPC threads: kernel default EEVDF slice restored "
-                  "(effective " +
-                      std::to_string(effective_ns) + " ns)"
-                : "gRPC threads: EEVDF slice requested " +
-                      std::to_string(grpc_thread_slice_ns_) +
-                      " ns, effective " + std::to_string(effective_ns) +
-                      " ns");
+  const absl::Status status = SetSlice(grpc_thread_slice_ns_, &effective_ns);
+  if (status.ok()) {
+    logger_(
+        SliceLogSeverity::kInfo,
+        grpc_thread_slice_ns_ == 0
+            ? absl::StrCat("gRPC threads: kernel default EEVDF slice restored "
+                           "(effective ",
+                           effective_ns, " ns)")
+            : absl::StrCat("gRPC threads: EEVDF slice requested ",
+                           grpc_thread_slice_ns_, " ns, effective ",
+                           effective_ns, " ns"));
     return;
   }
+  std::string error(status.message());
   if (grpc_thread_slice_ns_ != 0) {
     uint64_t ignored = 0;
-    const std::string restore_error = SetSlice(0, &ignored);
-    if (!restore_error.empty()) {
-      error += "; restoring the default slice also failed: " + restore_error;
+    const absl::Status restore = SetSlice(0, &ignored);
+    if (!restore.ok()) {
+      absl::StrAppend(&error, "; restoring the default slice also failed: ",
+                      restore.message());
     }
     if (!tf_slice_applied_) {
-      Disable("gRPC thread slice not applied: " + error);
+      Disable(absl::StrCat("gRPC thread slice not applied: ", error));
       return;
     }
-    if (restore_error.empty()) {
+    if (restore.ok()) {
       state_ = State::kDisabled;
       logger_(SliceLogSeverity::kWarning,
-              "gRPC thread slice not applied: " + error +
-                  ". gRPC threads keep the kernel default slice; the "
-                  "TensorFlow slice stays in effect.");
+              absl::StrCat("gRPC thread slice not applied: ", error,
+                           ". gRPC threads keep the kernel default slice; "
+                           "the TensorFlow slice stays in effect."));
       return;
     }
   }
@@ -253,12 +258,13 @@ void ThreadSliceSetter::ApplyGrpcSlice() {
   // it, and gRPC's threads will inherit it.
   state_ = State::kDisabled;
   logger_(SliceLogSeverity::kError,
-          "gRPC threads could not be moved off the TensorFlow EEVDF slice (" +
-              error + "). gRPC threads will share the " +
-              std::to_string(tf_thread_slice_ns_) +
-              " ns TensorFlow slice, so TensorFlow threads are no longer "
-              "scheduled ahead of them. Serving continues; remove "
-              "--tf_thread_slice_ns if this persists.");
+          absl::StrCat("gRPC threads could not be moved off the TensorFlow "
+                       "EEVDF slice (",
+                       error, "). gRPC threads will share the ",
+                       tf_thread_slice_ns_,
+                       " ns TensorFlow slice, so TensorFlow threads are no "
+                       "longer scheduled ahead of them. Serving continues; "
+                       "remove --tf_thread_slice_ns if this persists."));
 }
 
 }  // namespace serving

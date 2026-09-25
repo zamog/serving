@@ -477,6 +477,10 @@ cc_library(
     name = "thread_sched_slice",
     srcs = ["thread_sched_slice.cc"],
     hdrs = ["thread_sched_slice.h"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],
 )
 
 cc_test(
@@ -486,6 +490,7 @@ cc_test(
     deps = [
         ":thread_sched_slice",
         "//tensorflow_serving/core/test_util:test_main",
+        "@com_google_absl//absl/status",
     ],
 )
 

@@ -25,6 +25,7 @@ limitations under the License.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/status/status.h"
 
 namespace tensorflow {
 namespace serving {
@@ -40,6 +41,12 @@ constexpr uint32_t kSchedFifo = 1;
 constexpr uint32_t kSchedBatch = 3;
 constexpr uint32_t kSchedIdle = 5;
 constexpr uint64_t kBaseSliceNs = 2800000;
+
+std::string ValidationError(int64_t tf_ns, int64_t grpc_ns) {
+  const absl::Status status = ValidateThreadSliceFlags(tf_ns, grpc_ns);
+  EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+  return std::string(status.message());
+}
 
 // Models the scheduler state of one thread as sched_getattr/sched_setattr see
 // it on Linux >= 6.12 (per_task_slices) or on older kernels.
@@ -119,32 +126,31 @@ class ThreadSliceSetterTest : public ::testing::Test {
 };
 
 TEST(ValidateThreadSliceFlagsTest, AcceptsValidPairs) {
-  EXPECT_EQ(ValidateThreadSliceFlags(0, 0), "");
-  EXPECT_EQ(ValidateThreadSliceFlags(500000, 4000000), "");
-  EXPECT_EQ(ValidateThreadSliceFlags(500000, 0), "");
-  EXPECT_EQ(ValidateThreadSliceFlags(0, 4000000), "");
-  EXPECT_EQ(ValidateThreadSliceFlags(1000000, 1000000), "");
-  EXPECT_EQ(ValidateThreadSliceFlags(kMinThreadSliceNs, kMaxThreadSliceNs), "");
+  EXPECT_TRUE(ValidateThreadSliceFlags(0, 0).ok());
+  EXPECT_TRUE(ValidateThreadSliceFlags(500000, 4000000).ok());
+  EXPECT_TRUE(ValidateThreadSliceFlags(500000, 0).ok());
+  EXPECT_TRUE(ValidateThreadSliceFlags(0, 4000000).ok());
+  EXPECT_TRUE(ValidateThreadSliceFlags(1000000, 1000000).ok());
+  EXPECT_TRUE(
+      ValidateThreadSliceFlags(kMinThreadSliceNs, kMaxThreadSliceNs).ok());
 }
 
 TEST(ValidateThreadSliceFlagsTest, RejectsNegative) {
-  EXPECT_THAT(ValidateThreadSliceFlags(-1, 0),
-              HasSubstr("must not be negative"));
-  EXPECT_THAT(ValidateThreadSliceFlags(0, -1),
-              HasSubstr("must not be negative"));
+  EXPECT_THAT(ValidationError(-1, 0), HasSubstr("must not be negative"));
+  EXPECT_THAT(ValidationError(0, -1), HasSubstr("must not be negative"));
 }
 
 TEST(ValidateThreadSliceFlagsTest, RejectsValuesTheKernelWouldClamp) {
-  EXPECT_THAT(ValidateThreadSliceFlags(1000, 0),
+  EXPECT_THAT(ValidationError(1000, 0),
               HasSubstr("server_options.tf_thread_slice_ns (1000) must be 0 "
                         "or between 100000 and 100000000 ns"));
-  EXPECT_THAT(ValidateThreadSliceFlags(0, kMaxThreadSliceNs + 1),
+  EXPECT_THAT(ValidationError(0, kMaxThreadSliceNs + 1),
               HasSubstr("server_options.grpc_thread_slice_ns (100000001) must "
                         "be 0 or between"));
 }
 
 TEST(ValidateThreadSliceFlagsTest, RejectsInvertedPair) {
-  EXPECT_THAT(ValidateThreadSliceFlags(4000000, 500000),
+  EXPECT_THAT(ValidationError(4000000, 500000),
               HasSubstr("server_options.tf_thread_slice_ns (4000000) must not "
                         "be greater than server_options.grpc_thread_slice_ns "
                         "(500000)"));
@@ -161,8 +167,8 @@ TEST_F(ThreadSliceSetterTest, BothFlagsZeroIssuesNoSyscalls) {
 
 TEST_F(ThreadSliceSetterTest, AppliesBothSlices) {
   auto setter = MakeSetter(500000, 4000000);
-  EXPECT_EQ(RunBothPhases(setter), std::make_pair(uint64_t{500000},
-                                                  uint64_t{4000000}));
+  EXPECT_EQ(RunBothPhases(setter),
+            std::make_pair(uint64_t{500000}, uint64_t{4000000}));
   ASSERT_EQ(kernel_.set_calls.size(), 2);
   for (const KernelSchedAttr& attr : kernel_.set_calls) {
     EXPECT_EQ(attr.size, 48);
@@ -298,8 +304,8 @@ TEST_F(ThreadSliceSetterTest, GrpcSetFailureKeepsTensorFlowSlice) {
   auto setter = MakeSetter(500000, 4000000);
   EXPECT_EQ(RunBothPhases(setter),
             std::make_pair(uint64_t{500000}, kBaseSliceNs));
-  ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kInfo,
-                                        SliceLogSeverity::kWarning));
+  ASSERT_THAT(Severities(),
+              ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kWarning));
   EXPECT_THAT(logs_[1].second,
               HasSubstr("gRPC threads keep the kernel default slice; the "
                         "TensorFlow slice stays in effect"));
@@ -370,8 +376,8 @@ TEST(ThreadSliceSetterRealKernelTest, NewThreadsInheritOrFeatureIsOff) {
     EXPECT_EQ(tf_thread, 0);
     EXPECT_EQ(grpc_thread, 0);
   } else {
-    EXPECT_THAT(severities, ElementsAre(SliceLogSeverity::kInfo,
-                                        SliceLogSeverity::kInfo));
+    EXPECT_THAT(severities,
+                ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kInfo));
     EXPECT_EQ(tf_thread, 500000);
     EXPECT_EQ(grpc_thread, 4000000);
     KernelSchedAttr attr;
