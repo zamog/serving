@@ -123,6 +123,19 @@ void ThreadSliceSetter::Disable(absl::string_view reason) {
                        "have no effect."));
 }
 
+void ThreadSliceSetter::ReportGrpcSharesTensorFlowSlice(
+    absl::string_view error) {
+  state_ = State::kDisabled;
+  logger_(SliceLogSeverity::kError,
+          absl::StrCat("gRPC threads could not be moved off the TensorFlow "
+                       "EEVDF slice (",
+                       error, "). gRPC threads will share the ",
+                       tf_thread_slice_ns_,
+                       " ns TensorFlow slice, so TensorFlow threads are no "
+                       "longer scheduled ahead of them. Serving continues; "
+                       "remove --tf_thread_slice_ns if this persists."));
+}
+
 bool ThreadSliceSetter::Probe() {
   if (state_ != State::kUnprobed) return state_ == State::kReady;
   KernelSchedAttr attr;
@@ -151,12 +164,33 @@ bool ThreadSliceSetter::Probe() {
         "sched_getattr reports no slice)");
     return false;
   }
+  starting_slice_ns_ = attr.sched_runtime;
+  // A flag left at 0 means the class keeps the starting slice (normally the
+  // kernel's base slice, which differs between hosts). Refuse a pair that
+  // would then schedule the TensorFlow threads behind the gRPC threads.
+  const uint64_t tf_ns = tf_thread_slice_ns_ != 0
+                             ? static_cast<uint64_t>(tf_thread_slice_ns_)
+                             : starting_slice_ns_;
+  const uint64_t grpc_ns = grpc_thread_slice_ns_ != 0
+                               ? static_cast<uint64_t>(grpc_thread_slice_ns_)
+                               : starting_slice_ns_;
+  if (tf_ns > grpc_ns) {
+    Disable(absl::StrCat(
+        "the TensorFlow threads would get a longer slice (", tf_ns,
+        " ns) than the gRPC threads (", grpc_ns,
+        " ns); an unset flag keeps this thread's starting slice of ",
+        starting_slice_ns_,
+        " ns, so set both flags or pick values on the "
+        "right side of it"));
+    return false;
+  }
   state_ = State::kReady;
   return true;
 }
 
 absl::Status ThreadSliceSetter::SetSlice(int64_t slice_ns,
-                                         uint64_t* effective_ns) {
+                                         uint64_t* effective_ns,
+                                         bool* kernel_accepted) {
   // Re-read so that the policy and nice value passed back are current. Flags
   // must stay 0: SCHED_FLAG_KEEP_PARAMS would make the kernel skip the slice.
   KernelSchedAttr attr;
@@ -166,7 +200,7 @@ absl::Status ThreadSliceSetter::SetSlice(int64_t slice_ns,
   }
   attr.size = kSchedAttrSizeVer0;
   attr.sched_flags = 0;
-  attr.sched_priority = 0;
+  attr.sched_priority = 0;  // The kernel rejects non-zero for fair policies.
   attr.sched_runtime = static_cast<uint64_t>(slice_ns);
   attr.sched_deadline = 0;
   attr.sched_period = 0;
@@ -174,6 +208,7 @@ absl::Status ThreadSliceSetter::SetSlice(int64_t slice_ns,
     return absl::InternalError(absl::StrCat("sched_setattr(slice ", slice_ns,
                                             " ns) failed: ", ErrnoText(error)));
   }
+  *kernel_accepted = true;
   KernelSchedAttr back;
   if (const int error = syscalls_.get(&back); error != 0) {
     return absl::InternalError(
@@ -193,18 +228,36 @@ absl::Status ThreadSliceSetter::SetSlice(int64_t slice_ns,
   return absl::OkStatus();
 }
 
+absl::Status ThreadSliceSetter::RestoreStartingSlice() {
+  // First try the kernel default (runtime 0): that also clears the kernel's
+  // custom-slice mark, so the thread keeps following the base_slice_ns
+  // tunable. Only if the thread started with a custom slice (inherited from
+  // whatever launched the server) set that value back explicitly.
+  bool accepted = false;
+  uint64_t effective_ns = 0;
+  absl::Status status = SetSlice(0, &effective_ns, &accepted);
+  if (!status.ok() || effective_ns == starting_slice_ns_) return status;
+  return SetSlice(static_cast<int64_t>(starting_slice_ns_), &effective_ns,
+                  &accepted);
+}
+
 void ThreadSliceSetter::ApplyTensorFlowSlice() {
   if (tf_thread_slice_ns_ == 0 || !Probe()) return;
+  bool accepted = false;
   uint64_t effective_ns = 0;
-  const absl::Status status = SetSlice(tf_thread_slice_ns_, &effective_ns);
+  const absl::Status status =
+      SetSlice(tf_thread_slice_ns_, &effective_ns, &accepted);
   if (!status.ok()) {
-    // A set that went through but read back wrong may have changed the
-    // slice; put the default back before giving up. Failure here is moot:
-    // the feature is off and there is nothing more to try.
-    uint64_t ignored = 0;
-    SetSlice(0, &ignored).IgnoreError();
-    Disable(absl::StrCat("TensorFlow thread slice not applied: ",
-                         status.message()));
+    std::string reason =
+        absl::StrCat("TensorFlow thread slice not applied: ", status.message());
+    // Only a set the kernel accepted can have changed the slice.
+    if (accepted) {
+      if (const absl::Status restore = RestoreStartingSlice(); !restore.ok()) {
+        absl::StrAppend(&reason, "; restoring the starting slice also failed: ",
+                        restore.message());
+      }
+    }
+    Disable(reason);
     return;
   }
   tf_slice_applied_ = true;
@@ -216,55 +269,58 @@ void ThreadSliceSetter::ApplyTensorFlowSlice() {
 
 void ThreadSliceSetter::ApplyGrpcSlice() {
   // With only the TensorFlow slice requested this phase still has to run:
-  // it restores the default so gRPC's threads do not inherit that slice.
+  // it restores the starting slice so gRPC's threads do not inherit the
+  // TensorFlow slice.
   if (grpc_thread_slice_ns_ == 0 && !tf_slice_applied_) return;
   if (!Probe()) return;
+  if (grpc_thread_slice_ns_ == 0) {
+    if (const absl::Status restore = RestoreStartingSlice(); !restore.ok()) {
+      ReportGrpcSharesTensorFlowSlice(restore.message());
+      return;
+    }
+    logger_(SliceLogSeverity::kInfo,
+            absl::StrCat("gRPC threads: starting EEVDF slice restored (",
+                         starting_slice_ns_, " ns)"));
+    return;
+  }
+  bool accepted = false;
   uint64_t effective_ns = 0;
-  const absl::Status status = SetSlice(grpc_thread_slice_ns_, &effective_ns);
+  const absl::Status status =
+      SetSlice(grpc_thread_slice_ns_, &effective_ns, &accepted);
   if (status.ok()) {
-    logger_(
-        SliceLogSeverity::kInfo,
-        grpc_thread_slice_ns_ == 0
-            ? absl::StrCat("gRPC threads: kernel default EEVDF slice restored "
-                           "(effective ",
-                           effective_ns, " ns)")
-            : absl::StrCat("gRPC threads: EEVDF slice requested ",
-                           grpc_thread_slice_ns_, " ns, effective ",
-                           effective_ns, " ns"));
+    logger_(SliceLogSeverity::kInfo,
+            absl::StrCat("gRPC threads: EEVDF slice requested ",
+                         grpc_thread_slice_ns_, " ns, effective ", effective_ns,
+                         " ns"));
     return;
   }
   std::string error(status.message());
-  if (grpc_thread_slice_ns_ != 0) {
-    uint64_t ignored = 0;
-    const absl::Status restore = SetSlice(0, &ignored);
-    if (!restore.ok()) {
-      absl::StrAppend(&error, "; restoring the default slice also failed: ",
-                      restore.message());
+  if (!tf_slice_applied_) {
+    // The thread is still on its starting slice unless the kernel accepted
+    // the failed set.
+    if (accepted) {
+      if (const absl::Status restore = RestoreStartingSlice(); !restore.ok()) {
+        absl::StrAppend(&error, "; restoring the starting slice also failed: ",
+                        restore.message());
+      }
     }
-    if (!tf_slice_applied_) {
-      Disable(absl::StrCat("gRPC thread slice not applied: ", error));
-      return;
-    }
-    if (restore.ok()) {
-      state_ = State::kDisabled;
-      logger_(SliceLogSeverity::kWarning,
-              absl::StrCat("gRPC thread slice not applied: ", error,
-                           ". gRPC threads keep the kernel default slice; "
-                           "the TensorFlow slice stays in effect."));
-      return;
-    }
+    Disable(absl::StrCat("gRPC thread slice not applied: ", error));
+    return;
   }
-  // Only reachable after the TensorFlow slice was applied: this thread keeps
-  // it, and gRPC's threads will inherit it.
+  // The thread is on the TensorFlow slice (or on whatever the failed set
+  // left): move it back to the starting slice.
+  if (const absl::Status restore = RestoreStartingSlice(); !restore.ok()) {
+    absl::StrAppend(&error, "; restoring the starting slice also failed: ",
+                    restore.message());
+    ReportGrpcSharesTensorFlowSlice(error);
+    return;
+  }
   state_ = State::kDisabled;
-  logger_(SliceLogSeverity::kError,
-          absl::StrCat("gRPC threads could not be moved off the TensorFlow "
-                       "EEVDF slice (",
-                       error, "). gRPC threads will share the ",
-                       tf_thread_slice_ns_,
-                       " ns TensorFlow slice, so TensorFlow threads are no "
-                       "longer scheduled ahead of them. Serving continues; "
-                       "remove --tf_thread_slice_ns if this persists."));
+  logger_(SliceLogSeverity::kWarning,
+          absl::StrCat("gRPC thread slice not applied: ", error,
+                       ". gRPC threads keep the starting slice (",
+                       starting_slice_ns_,
+                       " ns); the TensorFlow slice stays in effect."));
 }
 
 }  // namespace serving

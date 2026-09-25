@@ -57,10 +57,13 @@ class FakeKernel {
   int32_t nice = 0;
   uint64_t flags = 0;
   uint64_t custom_slice = 0;  // 0 = none, the base slice applies.
-  int get_error = 0;
+  int get_error = EFAULT;
+  std::set<int> failing_get_calls;  // 1-based indices into get calls.
   int set_error = EPERM;
   std::set<int> failing_set_calls;  // 1-based indices into set_calls.
-  bool sets_ignored = false;        // sched_setattr succeeds but does nothing.
+  std::set<int> ignored_set_calls;  // Succeed but change nothing.
+  bool sets_ignored = false;        // Every sched_setattr is ignored.
+  int get_calls = 0;
   std::vector<KernelSchedAttr> set_calls;
 
   uint64_t EffectiveSlice() const {
@@ -71,7 +74,7 @@ class FakeKernel {
   SchedAttrSyscalls Syscalls() {
     return {
         [this](KernelSchedAttr* attr) {
-          if (get_error != 0) return get_error;
+          if (failing_get_calls.count(++get_calls) > 0) return get_error;
           *attr = KernelSchedAttr{};
           attr->size = 48;
           attr->sched_policy = policy;
@@ -82,10 +85,11 @@ class FakeKernel {
         },
         [this](const KernelSchedAttr& attr) {
           set_calls.push_back(attr);
-          if (failing_set_calls.count(static_cast<int>(set_calls.size())) > 0) {
-            return set_error;
-          }
-          if (sets_ignored) return 0;
+          const int call = static_cast<int>(set_calls.size());
+          if (failing_set_calls.count(call) > 0) return set_error;
+          // Like the kernel: fair policies take no static priority.
+          if (attr.sched_priority != 0) return EINVAL;
+          if (sets_ignored || ignored_set_calls.count(call) > 0) return 0;
           policy = attr.sched_policy;
           nice = attr.sched_nice;
           if (per_task_slices) custom_slice = attr.sched_runtime;
@@ -118,6 +122,14 @@ class ThreadSliceSetterTest : public ::testing::Test {
   std::vector<SliceLogSeverity> Severities() const {
     std::vector<SliceLogSeverity> result;
     for (const auto& log : logs_) result.push_back(log.first);
+    return result;
+  }
+
+  std::vector<uint64_t> SetRuntimes() const {
+    std::vector<uint64_t> result;
+    for (const auto& attr : kernel_.set_calls) {
+      result.push_back(attr.sched_runtime);
+    }
     return result;
   }
 
@@ -157,9 +169,9 @@ TEST(ValidateThreadSliceFlagsTest, RejectsInvertedPair) {
 }
 
 TEST_F(ThreadSliceSetterTest, BothFlagsZeroIssuesNoSyscalls) {
-  kernel_.get_error = EFAULT;  // Any syscall would log.
   auto setter = MakeSetter(0, 0);
   RunBothPhases(setter);
+  EXPECT_EQ(kernel_.get_calls, 0);
   EXPECT_THAT(kernel_.set_calls, IsEmpty());
   EXPECT_THAT(logs_, IsEmpty());
   EXPECT_FALSE(setter.enabled());
@@ -174,6 +186,9 @@ TEST_F(ThreadSliceSetterTest, AppliesBothSlices) {
     EXPECT_EQ(attr.size, 48);
     EXPECT_EQ(attr.sched_policy, kSchedOther);
     EXPECT_EQ(attr.sched_flags, 0);  // No SCHED_FLAG_KEEP_PARAMS.
+    EXPECT_EQ(attr.sched_priority, 0);
+    EXPECT_EQ(attr.sched_deadline, 0);
+    EXPECT_EQ(attr.sched_period, 0);
   }
   EXPECT_THAT(
       logs_,
@@ -187,22 +202,32 @@ TEST_F(ThreadSliceSetterTest, AppliesBothSlices) {
   EXPECT_TRUE(setter.enabled());
 }
 
-TEST_F(ThreadSliceSetterTest, TensorFlowOnlyRestoresDefaultForGrpc) {
+TEST_F(ThreadSliceSetterTest, TensorFlowOnlyRestoresStartingSliceForGrpc) {
   auto setter = MakeSetter(500000, 0);
   EXPECT_EQ(RunBothPhases(setter),
             std::make_pair(uint64_t{500000}, kBaseSliceNs));
-  ASSERT_EQ(kernel_.set_calls.size(), 2);
-  EXPECT_EQ(kernel_.set_calls[1].sched_runtime, 0);
-  EXPECT_THAT(logs_[1].second,
-              HasSubstr("gRPC threads: kernel default EEVDF slice restored "
-                        "(effective 2800000 ns)"));
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 0));
+  EXPECT_EQ(kernel_.custom_slice, 0);  // Follows base_slice_ns again.
+  ASSERT_THAT(Severities(),
+              ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kInfo));
+  EXPECT_EQ(logs_[1].second,
+            "gRPC threads: starting EEVDF slice restored (2800000 ns)");
+}
+
+TEST_F(ThreadSliceSetterTest, InheritedCustomSliceIsRestoredExactly) {
+  kernel_.custom_slice = 1500000;  // Set by whatever launched the server.
+  auto setter = MakeSetter(500000, 0);
+  EXPECT_EQ(RunBothPhases(setter),
+            std::make_pair(uint64_t{500000}, uint64_t{1500000}));
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 0, 1500000));
+  EXPECT_THAT(logs_[1].second, HasSubstr("restored (1500000 ns)"));
 }
 
 TEST_F(ThreadSliceSetterTest, GrpcOnlyLeavesTensorFlowThreadsAlone) {
   auto setter = MakeSetter(0, 4000000);
   EXPECT_EQ(RunBothPhases(setter),
             std::make_pair(kBaseSliceNs, uint64_t{4000000}));
-  ASSERT_EQ(kernel_.set_calls.size(), 1);
+  EXPECT_THAT(SetRuntimes(), ElementsAre(4000000));
   EXPECT_THAT(Severities(), ElementsAre(SliceLogSeverity::kInfo));
 }
 
@@ -218,30 +243,53 @@ TEST_F(ThreadSliceSetterTest, KeepsPolicyAndNice) {
   }
 }
 
-TEST_F(ThreadSliceSetterTest, OldKernelWarnsOnceAndChangesNothing) {
-  kernel_.per_task_slices = false;  // e.g. 6.6: sched_runtime reads back 0.
-  auto setter = MakeSetter(500000, 4000000);
-  RunBothPhases(setter);
-  EXPECT_THAT(kernel_.set_calls, IsEmpty());
-  ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
-  EXPECT_THAT(logs_[0].second, HasSubstr("needs Linux >= 6.12"));
-  EXPECT_THAT(logs_[0].second,
-              HasSubstr("Starting with the kernel's default scheduling"));
-  EXPECT_FALSE(setter.enabled());
+TEST_F(ThreadSliceSetterTest, SingleFlagThatInvertsTheOrderDisables) {
+  // Unset flags keep the 2.8 ms starting slice: a 10 ms TensorFlow slice
+  // alone, or a 0.5 ms gRPC slice alone, would put gRPC first.
+  for (const auto& flags : {std::make_pair(int64_t{10000000}, int64_t{0}),
+                            std::make_pair(int64_t{0}, int64_t{500000})}) {
+    kernel_ = FakeKernel{};
+    logs_.clear();
+    auto setter = MakeSetter(flags.first, flags.second);
+    EXPECT_EQ(RunBothPhases(setter),
+              std::make_pair(kBaseSliceNs, kBaseSliceNs));
+    EXPECT_THAT(kernel_.set_calls, IsEmpty());
+    ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
+    EXPECT_THAT(logs_[0].second, HasSubstr("starting slice of 2800000 ns"));
+  }
 }
 
-TEST_F(ThreadSliceSetterTest, OldKernelGrpcOnlyWarnsOnce) {
-  kernel_.per_task_slices = false;
-  auto setter = MakeSetter(0, 4000000);
+TEST_F(ThreadSliceSetterTest, SingleFlagOnTheRightSideIsApplied) {
+  auto setter = MakeSetter(kBaseSliceNs, 0);  // Equal is not inverted.
   RunBothPhases(setter);
-  EXPECT_THAT(kernel_.set_calls, IsEmpty());
-  EXPECT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
+  EXPECT_TRUE(setter.enabled());
+  EXPECT_THAT(Severities(),
+              ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kInfo));
+}
+
+TEST_F(ThreadSliceSetterTest, OldKernelWarnsOnceAndChangesNothing) {
+  for (const auto& flags : {std::make_pair(int64_t{500000}, int64_t{4000000}),
+                            std::make_pair(int64_t{500000}, int64_t{0}),
+                            std::make_pair(int64_t{0}, int64_t{4000000})}) {
+    kernel_ = FakeKernel{};
+    kernel_.per_task_slices = false;  // e.g. 6.6: sched_runtime reads 0.
+    logs_.clear();
+    auto setter = MakeSetter(flags.first, flags.second);
+    RunBothPhases(setter);
+    EXPECT_THAT(kernel_.set_calls, IsEmpty());
+    ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
+    EXPECT_THAT(logs_[0].second, HasSubstr("needs Linux >= 6.12"));
+    EXPECT_THAT(logs_[0].second,
+                HasSubstr("Starting with the kernel's default scheduling"));
+    EXPECT_FALSE(setter.enabled());
+  }
 }
 
 TEST_F(ThreadSliceSetterTest, BlockedSyscallWarnsAndChangesNothing) {
   for (const int error : {ENOSYS, EPERM}) {
     kernel_ = FakeKernel{};
     kernel_.get_error = error;
+    kernel_.failing_get_calls = {1, 2, 3, 4};
     logs_.clear();
     auto setter = MakeSetter(500000, 4000000);
     RunBothPhases(setter);
@@ -274,12 +322,13 @@ TEST_F(ThreadSliceSetterTest, ResetOnForkDisables) {
   EXPECT_THAT(logs_[0].second, HasSubstr("SCHED_RESET_ON_FORK"));
 }
 
-TEST_F(ThreadSliceSetterTest, TensorFlowSetFailureDisablesBothPhases) {
+TEST_F(ThreadSliceSetterTest, RejectedTensorFlowSetChangesNothingMore) {
+  kernel_.custom_slice = 1500000;
   kernel_.failing_set_calls = {1};
   auto setter = MakeSetter(500000, 4000000);
-  EXPECT_EQ(RunBothPhases(setter), std::make_pair(kBaseSliceNs, kBaseSliceNs));
-  ASSERT_EQ(kernel_.set_calls.size(), 2);  // The failed set, then a restore.
-  EXPECT_EQ(kernel_.set_calls[1].sched_runtime, 0);
+  EXPECT_EQ(RunBothPhases(setter),
+            std::make_pair(uint64_t{1500000}, uint64_t{1500000}));
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000));  // No restore needed.
   ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
   EXPECT_THAT(logs_[0].second,
               HasSubstr("TensorFlow thread slice not applied: "
@@ -287,16 +336,32 @@ TEST_F(ThreadSliceSetterTest, TensorFlowSetFailureDisablesBothPhases) {
   EXPECT_FALSE(setter.enabled());
 }
 
-TEST_F(ThreadSliceSetterTest, ReadBackMismatchRestoresDefault) {
-  kernel_.sets_ignored = true;  // Accepted but not applied.
+TEST_F(ThreadSliceSetterTest, TensorFlowReadBackMismatchRestores) {
+  kernel_.ignored_set_calls = {1};  // Accepted but not applied.
   auto setter = MakeSetter(500000, 4000000);
   RunBothPhases(setter);
-  ASSERT_EQ(kernel_.set_calls.size(), 2);
-  EXPECT_EQ(kernel_.set_calls[1].sched_runtime, 0);
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 0));
   ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
   EXPECT_THAT(logs_[0].second,
               HasSubstr("effective slice of 2800000 ns after a request for "
                         "500000 ns"));
+}
+
+TEST_F(ThreadSliceSetterTest, ReadBackFailureAfterAcceptedSetRestores) {
+  kernel_.failing_get_calls = {3};  // Probe, pre-read, then the read-back.
+  auto setter = MakeSetter(500000, 4000000);
+  EXPECT_EQ(RunBothPhases(setter), std::make_pair(kBaseSliceNs, kBaseSliceNs));
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 0));
+  ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
+  EXPECT_THAT(logs_[0].second, HasSubstr("sched_getattr failed"));
+}
+
+TEST_F(ThreadSliceSetterTest, PreReadFailureIssuesNoSet) {
+  kernel_.failing_get_calls = {2};  // The re-read before the first set.
+  auto setter = MakeSetter(500000, 4000000);
+  RunBothPhases(setter);
+  EXPECT_THAT(kernel_.set_calls, IsEmpty());
+  ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
 }
 
 TEST_F(ThreadSliceSetterTest, GrpcSetFailureKeepsTensorFlowSlice) {
@@ -304,12 +369,36 @@ TEST_F(ThreadSliceSetterTest, GrpcSetFailureKeepsTensorFlowSlice) {
   auto setter = MakeSetter(500000, 4000000);
   EXPECT_EQ(RunBothPhases(setter),
             std::make_pair(uint64_t{500000}, kBaseSliceNs));
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 4000000, 0));
   ASSERT_THAT(Severities(),
               ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kWarning));
   EXPECT_THAT(logs_[1].second,
-              HasSubstr("gRPC threads keep the kernel default slice; the "
-                        "TensorFlow slice stays in effect"));
+              HasSubstr("gRPC threads keep the starting slice (2800000 ns); "
+                        "the TensorFlow slice stays in effect"));
   EXPECT_FALSE(setter.enabled());
+}
+
+TEST_F(ThreadSliceSetterTest, GrpcReadBackMismatchRestores) {
+  kernel_.ignored_set_calls = {2};
+  auto setter = MakeSetter(500000, 4000000);
+  EXPECT_EQ(RunBothPhases(setter),
+            std::make_pair(uint64_t{500000}, kBaseSliceNs));
+  ASSERT_THAT(Severities(),
+              ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kWarning));
+  EXPECT_THAT(logs_[1].second, HasSubstr("after a request for 4000000 ns"));
+}
+
+TEST_F(ThreadSliceSetterTest, RestoreThatLeavesTheTensorFlowSliceIsAnError) {
+  // The gRPC set and every restore are accepted but change nothing, so the
+  // thread stays on the TensorFlow slice; that must not be reported as a
+  // successful restore.
+  kernel_.ignored_set_calls = {2, 3, 4};
+  auto setter = MakeSetter(500000, 4000000);
+  EXPECT_EQ(RunBothPhases(setter),
+            std::make_pair(uint64_t{500000}, uint64_t{500000}));
+  ASSERT_THAT(Severities(),
+              ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kError));
+  EXPECT_THAT(logs_[1].second, HasSubstr("share the 500000 ns TensorFlow"));
 }
 
 TEST_F(ThreadSliceSetterTest, GrpcSetAndRestoreFailureIsAnError) {
@@ -319,35 +408,46 @@ TEST_F(ThreadSliceSetterTest, GrpcSetAndRestoreFailureIsAnError) {
             std::make_pair(uint64_t{500000}, uint64_t{500000}));
   ASSERT_THAT(Severities(),
               ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kError));
-  EXPECT_THAT(logs_[1].second, HasSubstr("restoring the default slice also "
-                                         "failed"));
-  EXPECT_THAT(logs_[1].second, HasSubstr("share the 500000 ns TensorFlow "
-                                         "slice"));
+  EXPECT_THAT(logs_[1].second,
+              HasSubstr("restoring the starting slice also failed"));
+  EXPECT_THAT(logs_[1].second,
+              HasSubstr("share the 500000 ns TensorFlow slice"));
 }
 
 TEST_F(ThreadSliceSetterTest, TensorFlowOnlyRestoreFailureIsAnError) {
   kernel_.failing_set_calls = {2};
   auto setter = MakeSetter(500000, 0);
   RunBothPhases(setter);
-  ASSERT_EQ(kernel_.set_calls.size(), 2);  // No second restore attempt.
+  EXPECT_THAT(SetRuntimes(), ElementsAre(500000, 0));
   ASSERT_THAT(Severities(),
               ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kError));
 }
 
-TEST_F(ThreadSliceSetterTest, GrpcOnlySetFailureWarns) {
+TEST_F(ThreadSliceSetterTest, GrpcOnlyRejectedSetWarns) {
   kernel_.failing_set_calls = {1};
   auto setter = MakeSetter(0, 4000000);
   RunBothPhases(setter);
+  EXPECT_THAT(SetRuntimes(), ElementsAre(4000000));  // Nothing to restore.
   ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
   EXPECT_THAT(logs_[0].second, HasSubstr("have no effect"));
+}
+
+TEST_F(ThreadSliceSetterTest, GrpcOnlyReadBackMismatchRestores) {
+  kernel_.ignored_set_calls = {1};
+  auto setter = MakeSetter(0, 4000000);
+  RunBothPhases(setter);
+  EXPECT_THAT(SetRuntimes(), ElementsAre(4000000, 0));
+  ASSERT_THAT(Severities(), ElementsAre(SliceLogSeverity::kWarning));
 }
 
 #if defined(__linux__)
 // Against the running kernel: on >= 6.12 threads created after each phase
 // inherit that phase's slice; on older kernels nothing changes and one
-// warning is logged. Either way the process keeps running.
+// warning is logged. Skipped where this process cannot use slices at all.
 TEST(ThreadSliceSetterRealKernelTest, NewThreadsInheritOrFeatureIsOff) {
   const SchedAttrSyscalls syscalls = LinuxSchedAttrSyscalls();
+  KernelSchedAttr start;
+  if (syscalls.get(&start) != 0) GTEST_SKIP() << "sched_getattr unavailable";
   const auto own_slice = [&syscalls] {
     KernelSchedAttr attr;
     return syscalls.get(&attr) == 0 ? attr.sched_runtime : ~uint64_t{0};
@@ -357,35 +457,50 @@ TEST(ThreadSliceSetterRealKernelTest, NewThreadsInheritOrFeatureIsOff) {
     std::thread([&] { slice = own_slice(); }).join();
     return slice;
   };
-  const uint64_t before = own_slice();
-  ASSERT_NE(before, ~uint64_t{0});
 
-  std::vector<SliceLogSeverity> severities;
+  std::vector<std::pair<SliceLogSeverity, std::string>> logs;
   ThreadSliceSetter setter(
       500000, 4000000,
-      [&severities](SliceLogSeverity severity, const std::string&) {
-        severities.push_back(severity);
+      [&logs](SliceLogSeverity severity, const std::string& message) {
+        logs.emplace_back(severity, message);
       });
   setter.ApplyTensorFlowSlice();
   const uint64_t tf_thread = slice_of_new_thread();
   setter.ApplyGrpcSlice();
   const uint64_t grpc_thread = slice_of_new_thread();
 
-  if (before == 0) {
-    EXPECT_THAT(severities, ElementsAre(SliceLogSeverity::kWarning));
+  if (start.sched_runtime == 0) {
+    // Kernel without per-task slices.
+    ASSERT_EQ(logs.size(), 1);
+    EXPECT_EQ(logs[0].first, SliceLogSeverity::kWarning);
     EXPECT_EQ(tf_thread, 0);
     EXPECT_EQ(grpc_thread, 0);
-  } else {
-    EXPECT_THAT(severities,
-                ElementsAre(SliceLogSeverity::kInfo, SliceLogSeverity::kInfo));
-    EXPECT_EQ(tf_thread, 500000);
-    EXPECT_EQ(grpc_thread, 4000000);
-    KernelSchedAttr attr;
-    ASSERT_EQ(syscalls.get(&attr), 0);
-    attr.sched_flags = 0;
-    attr.sched_runtime = 0;
-    EXPECT_EQ(syscalls.set(attr), 0);  // Leave the test thread as found.
+    return;
   }
+  if (!setter.enabled()) {
+    // Supported kernel, but this process may not use slices (policy,
+    // SCHED_RESET_ON_FORK, LSM): the library must have said so and changed
+    // nothing.
+    ASSERT_EQ(logs.size(), 1);
+    EXPECT_EQ(own_slice(), start.sched_runtime);
+    GTEST_SKIP() << logs[0].second;
+  }
+  EXPECT_THAT(logs, ElementsAre(Pair(SliceLogSeverity::kInfo, ::testing::_),
+                                Pair(SliceLogSeverity::kInfo, ::testing::_)));
+  EXPECT_EQ(tf_thread, 500000);
+  EXPECT_EQ(grpc_thread, 4000000);
+  // Leave the test thread as found: the kernel default first, then the
+  // starting value if it was a custom one.
+  KernelSchedAttr attr;
+  ASSERT_EQ(syscalls.get(&attr), 0);
+  attr.sched_flags = 0;
+  attr.sched_runtime = 0;
+  EXPECT_EQ(syscalls.set(attr), 0);
+  if (own_slice() != start.sched_runtime) {
+    attr.sched_runtime = start.sched_runtime;
+    EXPECT_EQ(syscalls.set(attr), 0);
+  }
+  EXPECT_EQ(own_slice(), start.sched_runtime);
 }
 #endif
 

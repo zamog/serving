@@ -50,6 +50,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/init_main.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/command_line_flags.h"
 #include "tensorflow_serving/model_servers/server.h"
 #include "tensorflow_serving/model_servers/version.h"
@@ -376,6 +377,8 @@ int main(int argc, char** argv) {
   tensorflow::serving::main::Server server;
   const auto& status = server.BuildAndStart(options);
   if (!status.ok()) {
+    // Also log it: stdout is often not collected, and the tests read stderr.
+    LOG(ERROR) << "Failed to start server. Error: " << status;
     std::cout << "Failed to start server. Error: " << status << "\n";
     return -1;
   }

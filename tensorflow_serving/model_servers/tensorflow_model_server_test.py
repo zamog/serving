@@ -21,6 +21,7 @@ from __future__ import print_function
 
 import json
 import os
+import select
 import subprocess
 import sys
 import time
@@ -470,17 +471,41 @@ class TensorflowModelServerTest(
     self.assertNotEqual(proc.stderr, None)
     self.assertGreater(proc.stderr.read().find(error_message), -1)
 
+  def _ReadStderrLineWith(self, proc, needles, timeout_secs=30):
+    """Returns the first stderr line containing one of needles, or None."""
+    deadline = time.time() + timeout_secs
+    fd = proc.stderr.fileno()
+    pending = b''
+    while time.time() < deadline:
+      ready, _, _ = select.select([fd], [], [], deadline - time.time())
+      if not ready:
+        break
+      chunk = os.read(fd, 4096)
+      if not chunk:
+        break
+      lines = (pending + chunk).split(b'\n')
+      pending = lines.pop()
+      for line in lines:
+        if any(needle in line for needle in needles):
+          return line
+    return None
+
   def testGoodThreadSlices(self):
     """Test server starts and serves with EEVDF thread slices set.
 
-    Passes on any kernel: without per-thread slice support (Linux < 6.12) the
-    server logs a warning and starts with the default scheduling.
+    Passes on any kernel: with per-thread slice support (Linux >= 6.12) the
+    server logs the applied slice, otherwise a warning, and serves either way.
     """
-    model_server_address = TensorflowModelServerTest.RunServer(
+    proc, model_server_address = TensorflowModelServerTest.RunServer(
         'default',
         self._GetSavedModelBundlePath(),
         tf_thread_slice_ns=500000,
-        grpc_thread_slice_ns=4000000)[1]
+        grpc_thread_slice_ns=4000000,
+        pipe=subprocess.PIPE)[:2]
+    line = self._ReadStderrLineWith(
+        proc, [b'TensorFlow threads: EEVDF slice requested 500000 ns',
+               b'Per-thread EEVDF slices disabled'])
+    self.assertIsNotNone(line, 'no EEVDF slice log line on stderr')
     self.VerifyPredictRequest(
         model_server_address,
         expected_output=3.0,

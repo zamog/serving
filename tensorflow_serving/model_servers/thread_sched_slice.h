@@ -75,9 +75,11 @@ using SliceLogger =
 // Applies --tf_thread_slice_ns and --grpc_thread_slice_ns to the calling
 // thread in two phases. Never fails the server: if the kernel or the runtime
 // environment cannot honour the flags (kernel < 6.12, syscall blocked by
-// seccomp, non-fair scheduling policy, SCHED_RESET_ON_FORK, unexpected
-// read-back) it logs one warning, leaves or restores the kernel default slice
-// and turns itself off. With both flags zero it issues no syscalls at all.
+// seccomp or an LSM, non-fair scheduling policy, SCHED_RESET_ON_FORK,
+// unexpected read-back, or a single flag that would order the TensorFlow
+// threads behind the gRPC threads) it logs one warning, leaves or restores
+// the slice the thread started with and turns itself off. With both flags
+// zero it issues no syscalls at all.
 //
 // Not thread-safe; both phases must run on the same thread, the one that
 // creates the TensorFlow threads and then the gRPC threads.
@@ -96,7 +98,8 @@ class ThreadSliceSetter final {
 
   // Call after ApplyTensorFlowSlice() and before gRPC's threads are created.
   // Sets the gRPC slice, or, if only the TensorFlow slice was set, restores
-  // the kernel default so gRPC's threads do not inherit the TensorFlow slice.
+  // the slice the thread started with so gRPC's threads do not inherit the
+  // TensorFlow slice.
   void ApplyGrpcSlice();
 
   // False once the feature has been turned off for this process.
@@ -106,19 +109,26 @@ class ThreadSliceSetter final {
   enum class State { kUnprobed, kReady, kDisabled };
 
   // Reads the calling thread's attributes and decides whether the feature
-  // can work here. Changes nothing.
+  // can work here; records the thread's starting slice. Changes nothing.
   bool Probe();
   // Sets the calling thread's slice (0 = kernel default) keeping its policy
   // and nice value, then verifies it; *effective_ns receives the slice read
-  // back.
-  absl::Status SetSlice(int64_t slice_ns, uint64_t* effective_ns);
+  // back. *kernel_accepted is set to true once sched_setattr has succeeded,
+  // i.e. when the thread's slice may differ from before even on error.
+  absl::Status SetSlice(int64_t slice_ns, uint64_t* effective_ns,
+                        bool* kernel_accepted);
+  // Puts back the slice recorded by Probe() and verifies it exactly.
+  absl::Status RestoreStartingSlice();
   void Disable(absl::string_view reason);
+  // Reports that gRPC's threads will inherit the TensorFlow slice.
+  void ReportGrpcSharesTensorFlowSlice(absl::string_view error);
 
   const int64_t tf_thread_slice_ns_;
   const int64_t grpc_thread_slice_ns_;
   const SliceLogger logger_;
   const SchedAttrSyscalls syscalls_;
   State state_ = State::kUnprobed;
+  uint64_t starting_slice_ns_ = 0;
   bool tf_slice_applied_ = false;
 };
 
