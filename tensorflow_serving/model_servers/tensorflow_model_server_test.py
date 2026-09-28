@@ -471,6 +471,25 @@ class TensorflowModelServerTest(
     if not sys.platform.startswith('linux'):
       self.skipTest('OS thread names are only set on Linux')
     proc, model_server_address = TensorflowModelServerTest.RunServer(
+        'default', self._GetSavedModelBundlePath())[:2]
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=self._GetModelVersion(
+            self._GetSavedModelHalfPlusThreePath()))
+    comms = self._OsThreadNames(proc)
+    # The Eigen pool "tf_numa_-1_Eigen" is 16 bytes; untruncated,
+    # pthread_setname_np would fail with ERANGE and leave it unnamed.
+    self.assertIn(
+        'tf_numa_-1_Eige', comms,
+        'no tf_numa_-1_Eige thread among: {}'.format(sorted(set(comms))))
+
+  def testBatchThreadNamesExposedToOs(self):
+    """Test the batch scheduler's threads carry their name."""
+    if not sys.platform.startswith('linux'):
+      self.skipTest('OS thread names are only set on Linux')
+    proc, model_server_address = TensorflowModelServerTest.RunServer(
         'default',
         self._GetSavedModelBundlePath(),
         batching_parameters_file=self._GetBatchingParametersFile())[:2]
@@ -481,12 +500,10 @@ class TensorflowModelServerTest(
         expected_version=self._GetModelVersion(
             self._GetSavedModelHalfPlusThreePath()))
     comms = self._OsThreadNames(proc)
-    # The batch threads are named "model_server_batch_threads_" (27 bytes);
-    # untruncated, pthread_setname_np would fail and leave the thread
-    # unnamed. batching_config.txt sets num_batch_threads to 8.
+    # batching_config.txt sets num_batch_threads to 8.
     self.assertEqual(
-        comms.count('model_server_ba'), 8,
-        'expected 8 model_server_ba threads among: {}'.format(
+        comms.count('batch_threads_'), 8,
+        'expected 8 batch_threads_ threads among: {}'.format(
             sorted(set(comms))))
 
   def testGoodGrpcSyncServerOptions(self):
