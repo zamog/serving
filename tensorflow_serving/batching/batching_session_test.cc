@@ -40,6 +40,7 @@ limitations under the License.
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/public/session_options.h"
+#include "tensorflow_serving/batching/async_run_session.h"
 #include "tensorflow_serving/servables/tensorflow/serving_session.h"
 #include "tensorflow_serving/test_util/test_util.h"
 
@@ -176,6 +177,39 @@ void ExpectError(const string& error_message,
                                      {} /* target nodes */, &outputs);
   ASSERT_FALSE(status.ok());
   EXPECT_EQ(error_message, status.message());
+}
+
+// Runs 'inputs' with AsyncRunSession::RunAsync() and waits for its 'done'
+// callback; returns the outcome of the run.
+absl::Status RunAsyncAndWait(
+    Session* session, const std::vector<std::pair<string, Tensor>>& inputs,
+    const std::vector<string>& output_tensor_names,
+    std::vector<Tensor>* outputs) {
+  auto* async_session = dynamic_cast<AsyncRunSession*>(session);
+  if (async_session == nullptr) {
+    return absl::InternalError("The session is not an AsyncRunSession");
+  }
+  RunMetadata run_metadata;
+  absl::Status run_status;
+  absl::Notification done;
+  TF_RETURN_IF_ERROR(async_session->RunAsync(
+      RunOptions(), &inputs, &output_tensor_names, outputs, &run_metadata,
+      thread::ThreadPoolOptions(), &run_status, [&done] { done.Notify(); }));
+  done.WaitForNotification();
+  return run_status;
+}
+
+// TestRequest() through RunAsync().
+void TestAsyncRequest(const std::vector<float>& x_values, TensorShape x_shape,
+                      const std::vector<float>& y_values, TensorShape y_shape,
+                      Session* session) {
+  const std::vector<std::pair<string, Tensor>> inputs = {
+      {"x", test::AsTensor<float>(x_values, x_shape)}};
+  std::vector<Tensor> outputs;
+  TF_ASSERT_OK(RunAsyncAndWait(session, inputs, {"y"}, &outputs));
+  ASSERT_EQ(1, outputs.size());
+  test::ExpectTensorEqual<float>(test::AsTensor<float>(y_values, y_shape),
+                                 outputs[0]);
 }
 
 // Creates a SignatureDef from a TensorSignature.
@@ -1099,6 +1133,221 @@ TEST_P(BatchingSessionTest, SubsetOutputTensors) {
         ASSERT_EQ(1, outputs.size());
         test::ExpectTensorEqual<float>(expected_output0, outputs[0]);
       }));
+}
+
+TEST_P(BatchingSessionTest, RunAsync) {
+  BasicBatchScheduler<BatchingSessionTask>::Options schedule_options;
+  schedule_options.max_batch_size = 4;  // fits two 2-unit tasks
+  schedule_options.batch_timeout_micros = 1 * 1000 * 1000;  // won't trigger
+  schedule_options.num_batch_threads = 1;
+  schedule_options = annotate_options(schedule_options);
+
+  std::unique_ptr<Session> batching_session;
+  BatchingSessionOptions batching_session_options;
+  TF_ASSERT_OK(CreateBasicBatchingSession(
+      schedule_options, batching_session_options, {{"x"}, {"y"}},
+      CreateHalfPlusTwoSession(), &batching_session));
+
+  // Two requests of size 2 fill a batch of 4.
+  std::unique_ptr<Thread> first_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "first_request_thread", [&batching_session] {
+        TestAsyncRequest({100.0f, 42.0f}, {2}, {52.0f, 23.0f}, {2},
+                         batching_session.get());
+      }));
+  std::unique_ptr<Thread> second_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "second_request_thread", [&batching_session] {
+        TestAsyncRequest({71.5f, 18.3f}, {2}, {37.75f, 11.15f}, {2},
+                         batching_session.get());
+      }));
+}
+
+TEST_P(BatchingSessionTest, RunAsyncSharesBatchWithRun) {
+  BasicBatchScheduler<BatchingSessionTask>::Options schedule_options;
+  schedule_options.max_batch_size = 4;  // fits two 2-unit tasks
+  schedule_options.batch_timeout_micros = 1 * 1000 * 1000;  // won't trigger
+  schedule_options.num_batch_threads = 1;
+  schedule_options = annotate_options(schedule_options);
+
+  std::unique_ptr<Session> batching_session;
+  BatchingSessionOptions batching_session_options;
+  TF_ASSERT_OK(CreateBasicBatchingSession(
+      schedule_options, batching_session_options, {{"x"}, {"y"}},
+      CreateHalfPlusTwoSession(), &batching_session));
+
+  // One request through Run() and one through RunAsync() fill a batch of 4;
+  // each must get its own rows back.
+  std::unique_ptr<Thread> sync_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "sync_request_thread", [&batching_session] {
+        TestRequest({100.0f, 42.0f}, {2}, {52.0f, 23.0f}, {2},
+                    batching_session.get());
+      }));
+  std::unique_ptr<Thread> async_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "async_request_thread", [&batching_session] {
+        TestAsyncRequest({71.5f, 18.3f}, {2}, {37.75f, 11.15f}, {2},
+                         batching_session.get());
+      }));
+}
+
+TEST_P(BatchingSessionTest, RunAsyncWithLargeBatchSplit) {
+  if (!enable_large_batch_splitting()) {
+    return;
+  }
+  BasicBatchScheduler<BatchingSessionTask>::Options schedule_options;
+  schedule_options.max_batch_size = 3;
+  schedule_options.batch_timeout_micros = 1e6;
+  schedule_options.num_batch_threads = 2;
+  schedule_options = annotate_options(schedule_options);
+  schedule_options.max_execution_batch_size = 2;
+  std::unique_ptr<Session> batching_session;
+  BatchingSessionOptions batching_session_options;
+  TF_ASSERT_OK(CreateBasicBatchingSession(
+      schedule_options, batching_session_options, {{"x"}, {"y"}},
+      CreateHalfPlusTwoSession(), &batching_session));
+
+  // 'max_execution_batch_size' is 2, so the second request (of size 3) is
+  // split across batches, and its outputs are merged before 'done' runs.
+  std::unique_ptr<Thread> first_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "first_request", [&batching_session] {
+        TestAsyncRequest({5, 6, 7, 8}, {1, 2, 2}, {4.5, 5, 5.5, 6}, {1, 2, 2},
+                         batching_session.get());
+      }));
+  std::unique_ptr<Thread> second_request_thread(Env::Default()->StartThread(
+      ThreadOptions(), "second_request", [&batching_session] {
+        TestAsyncRequest({5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+                         {3, 2, 2},
+                         {4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10},
+                         {3, 2, 2}, batching_session.get());
+      }));
+}
+
+TEST_P(BatchingSessionTest, RunAsyncReturnsBeforeItsBatchRuns) {
+  // Declared before the session, which runs pending requests when destroyed.
+  const std::vector<std::pair<string, Tensor>> first_inputs = {
+      {"x", test::AsTensor<float>({100.0f, 42.0f}, {2})}};
+  const std::vector<string> output_tensor_names = {"y"};
+  std::vector<Tensor> first_outputs;
+  RunMetadata first_run_metadata;
+  absl::Status first_run_status;
+  absl::Notification first_done;
+
+  BasicBatchScheduler<BatchingSessionTask>::Options schedule_options;
+  schedule_options.max_batch_size = 4;  // fits two 2-unit tasks
+  schedule_options.batch_timeout_micros = 10 * 1000 * 1000;  // won't trigger
+  schedule_options.num_batch_threads = 1;
+  schedule_options = annotate_options(schedule_options);
+  std::unique_ptr<Session> batching_session;
+  TF_ASSERT_OK(CreateBasicBatchingSession(
+      schedule_options, BatchingSessionOptions(), {{"x"}, {"y"}},
+      CreateHalfPlusTwoSession(), &batching_session));
+  auto* async_session = dynamic_cast<AsyncRunSession*>(batching_session.get());
+  ASSERT_NE(async_session, nullptr);
+
+  // The first request half fills the batch, so it has not run when RunAsync()
+  // returns.
+  TF_ASSERT_OK(async_session->RunAsync(
+      RunOptions(), &first_inputs, &output_tensor_names, &first_outputs,
+      &first_run_metadata, thread::ThreadPoolOptions(), &first_run_status,
+      [&first_done] { first_done.Notify(); }));
+  EXPECT_FALSE(first_done.HasBeenNotified());
+
+  // The second request fills the batch, which then runs both.
+  TestAsyncRequest({71.5f, 18.3f}, {2}, {37.75f, 11.15f}, {2},
+                   batching_session.get());
+  first_done.WaitForNotification();
+  TF_ASSERT_OK(first_run_status);
+  ASSERT_EQ(1, first_outputs.size());
+  test::ExpectTensorEqual<float>(test::AsTensor<float>({52.0f, 23.0f}, {2}),
+                                 first_outputs[0]);
+}
+
+TEST_P(BatchingSessionTest, RunAsyncCreatesSchedulerForUndeclaredSignature) {
+  // Declared before the session, which runs pending requests when destroyed.
+  const std::vector<std::pair<string, Tensor>> async_inputs = {
+      {"x2", test::AsTensor<float>({100.0f, 42.0f}, {2})}};
+  const std::vector<string> output_tensor_names = {"y3"};
+  std::vector<Tensor> async_outputs;
+  RunMetadata async_run_metadata;
+  absl::Status async_run_status;
+  absl::Notification async_done;
+
+  int num_schedulers = 0;
+  auto create_scheduler =
+      [&num_schedulers, this](
+          std::function<void(std::unique_ptr<Batch<BatchingSessionTask>>)>
+              process_batch_callback,
+          std::unique_ptr<BatchScheduler<BatchingSessionTask>>* scheduler) {
+        BasicBatchScheduler<BatchingSessionTask>::Options options;
+        options.max_batch_size = 4;  // fits two 2-unit tasks
+        options.batch_timeout_micros = 10 * 1000 * 1000;  // won't trigger
+        options.num_batch_threads = 1;
+        options = annotate_options(options);
+        std::unique_ptr<BasicBatchScheduler<BatchingSessionTask>>
+            basic_scheduler;
+        TF_RETURN_IF_ERROR(BasicBatchScheduler<BatchingSessionTask>::Create(
+            options, process_batch_callback, &basic_scheduler));
+        ++num_schedulers;
+        *scheduler = std::move(basic_scheduler);
+        return absl::OkStatus();
+      };
+  std::unique_ptr<Session> batching_session;
+  TF_ASSERT_OK(CreateBatchingSession(
+      BatchingSessionOptions(), {{{{"x"}, {"y"}}, create_scheduler}},
+      create_scheduler, CreateHalfPlusTwoSession(), &batching_session));
+  ASSERT_EQ(1, num_schedulers);
+  auto* async_session = dynamic_cast<AsyncRunSession*>(batching_session.get());
+  ASSERT_NE(async_session, nullptr);
+
+  // {x2} -> {y3} was not declared: RunAsync() makes its scheduler with the
+  // default creator, as Run() would.
+  TF_ASSERT_OK(async_session->RunAsync(
+      RunOptions(), &async_inputs, &output_tensor_names, &async_outputs,
+      &async_run_metadata, thread::ThreadPoolOptions(), &async_run_status,
+      [&async_done] { async_done.Notify(); }));
+  EXPECT_EQ(2, num_schedulers);
+
+  // Run() uses that scheduler, and its request fills the batch.
+  std::vector<Tensor> outputs;
+  TF_ASSERT_OK(batching_session->Run(
+      {{"x2", test::AsTensor<float>({71.5f, 18.3f}, {2})}}, {"y3"},
+      {} /* target nodes */, &outputs));
+  EXPECT_EQ(2, num_schedulers);
+  ASSERT_EQ(1, outputs.size());
+  test::ExpectTensorEqual<float>(test::AsTensor<float>({38.75f, 12.15f}, {2}),
+                                 outputs[0]);
+  async_done.WaitForNotification();
+  TF_ASSERT_OK(async_run_status);
+  ASSERT_EQ(1, async_outputs.size());
+  test::ExpectTensorEqual<float>(test::AsTensor<float>({53.0f, 24.0f}, {2}),
+                                 async_outputs[0]);
+}
+
+TEST(BatchingSessionTest, RunAsyncWithoutBatchSchedulerIsUnimplemented) {
+  BasicBatchScheduler<BatchingSessionTask>::Options schedule_options;
+  schedule_options.max_batch_size = 4;
+  schedule_options.batch_timeout_micros = 0;
+  schedule_options.num_batch_threads = 1;
+  std::unique_ptr<Session> batching_session;
+  TF_ASSERT_OK(CreateBasicBatchingSession(
+      schedule_options, BatchingSessionOptions(), {{"x"}, {"y"}},
+      CreateHalfPlusTwoSession(), &batching_session));
+  auto* async_session = dynamic_cast<AsyncRunSession*>(batching_session.get());
+  ASSERT_NE(async_session, nullptr);
+
+  // {x} -> {x} is not a declared signature, and the session has no default
+  // scheduler creator: RunAsync() leaves the request to Run().
+  const std::vector<std::pair<string, Tensor>> inputs = {
+      {"x", test::AsTensor<float>({1.0f, 2.0f}, {2})}};
+  const std::vector<string> output_tensor_names = {"x"};
+  std::vector<Tensor> outputs;
+  RunMetadata run_metadata;
+  absl::Status run_status;
+  bool done_called = false;
+  const absl::Status status = async_session->RunAsync(
+      RunOptions(), &inputs, &output_tensor_names, &outputs, &run_metadata,
+      thread::ThreadPoolOptions(), &run_status,
+      [&done_called] { done_called = true; });
+  EXPECT_EQ(absl::StatusCode::kUnimplemented, status.code());
+  EXPECT_FALSE(done_called);
 }
 
 INSTANTIATE_TEST_SUITE_P(Parameter, BatchingSessionTest, ::testing::Bool());

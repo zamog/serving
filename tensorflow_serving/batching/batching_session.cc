@@ -45,6 +45,7 @@ limitations under the License.
 #include "tensorflow/core/profiler/lib/traceme.h"
 #include "tensorflow/core/profiler/lib/traceme_encode.h"
 #include "tensorflow/core/public/session.h"
+#include "tensorflow_serving/batching/async_run_session.h"
 #include "tensorflow_serving/batching/batching_util.h"
 #include "tensorflow_serving/batching/incremental_barrier.h"
 #include "tensorflow_serving/batching/threadsafe_status.h"
@@ -157,7 +158,7 @@ TensorSignature TensorSignatureFromSignatureDefs(
 
 // A session that performs batching on top of a wrapped session. See the
 // documentation in batching_session.h for details and constraints.
-class BatchingSession : public ServingSession {
+class BatchingSession : public ServingSession, public AsyncRunSession {
  public:
   // Constructs a BatchingSession. Arguments:
   // - 'options' contains parameters. See batching_session.h.
@@ -225,6 +226,18 @@ class BatchingSession : public ServingSession {
       std::vector<Tensor>* outputs, RunMetadata* run_metadata,
       const thread::ThreadPoolOptions& thread_pool_options) override;
 
+  // Enqueues the request like Run() does, but returns once it is scheduled
+  // instead of waiting for its batch; see AsyncRunSession. Returns
+  // kUnimplemented for the requests Run() runs unbatched: those whose signature
+  // was not declared, when there is no default scheduler creator.
+  absl::Status RunAsync(const RunOptions& run_options,
+                        const std::vector<std::pair<string, Tensor>>* inputs,
+                        const std::vector<string>* output_tensor_names,
+                        std::vector<Tensor>* outputs, RunMetadata* run_metadata,
+                        const thread::ThreadPoolOptions& thread_pool_options,
+                        absl::Status* status,
+                        std::function<void()> done) override;
+
   absl::Status ListDevices(std::vector<DeviceAttributes>* response) override;
 
  private:
@@ -239,6 +252,13 @@ class BatchingSession : public ServingSession {
       const std::vector<string>& target_node_names,
       std::vector<Tensor>* outputs, RunMetadata* run_metadata,
       absl::optional<thread::ThreadPoolOptions> thread_pool_options);
+
+  // Sets '*batch_scheduler' to the scheduler for 'signature': the one declared
+  // for it, or else the one default_scheduler_creator_ makes for it on first
+  // use. Sets it to nullptr if there is neither.
+  absl::Status FindOrCreateBatchScheduler(
+      const TensorSignature& signature,
+      BatchScheduler<BatchingSessionTask>** batch_scheduler);
 
   // Computes the size of an input tensor list for batching purposes, by
   // analyzing the 0th dimension size of each of the tensors. All tensors in the
@@ -373,6 +393,35 @@ absl::Status BatchingSession::Run(
                      thread_pool_options);
 }
 
+absl::Status BatchingSession::FindOrCreateBatchScheduler(
+    const TensorSignature& signature,
+    BatchScheduler<BatchingSessionTask>** batch_scheduler) {
+  const auto batch_scheduler_it = batch_schedulers_.find(signature);
+  if (batch_scheduler_it != batch_schedulers_.end()) {
+    *batch_scheduler = batch_scheduler_it->second.get();
+    return absl::OkStatus();
+  }
+  *batch_scheduler = nullptr;
+  if (!default_scheduler_creator_.has_value()) {
+    return absl::OkStatus();
+  }
+  absl::MutexLock l(&mu_);
+  auto custom_it = custom_signature_batch_schedulers_.find(signature);
+  if (custom_it == custom_signature_batch_schedulers_.end()) {
+    std::unique_ptr<BatchScheduler<BatchingSessionTask>> new_batch_scheduler;
+    TF_RETURN_IF_ERROR(default_scheduler_creator_.value()(
+        [this, signature](std::unique_ptr<Batch<BatchingSessionTask>> batch) {
+          ProcessBatch(signature, std::move(batch));
+        },
+        &new_batch_scheduler));
+    custom_it = custom_signature_batch_schedulers_
+                    .emplace(signature, std::move(new_batch_scheduler))
+                    .first;
+  }
+  *batch_scheduler = custom_it->second.get();
+  return absl::OkStatus();
+}
+
 absl::Status BatchingSession::InternalRun(
     const RunOptions& run_options,
     const std::vector<std::pair<string, Tensor>>& inputs,
@@ -392,46 +441,29 @@ absl::Status BatchingSession::InternalRun(
   });
   const TensorSignature signature =
       TensorSignatureFromRunArgs(inputs, output_tensor_names);
-  auto batch_scheduler_it = batch_schedulers_.find(signature);
-  if (batch_scheduler_it == batch_schedulers_.end()) {
-    if (default_scheduler_creator_.has_value()) {
-      absl::MutexLock l(&mu_);
-      batch_scheduler_it = custom_signature_batch_schedulers_.find(signature);
-      if (batch_scheduler_it == custom_signature_batch_schedulers_.end()) {
-        std::unique_ptr<BatchScheduler<BatchingSessionTask>> batch_scheduler;
-        TF_RETURN_IF_ERROR(default_scheduler_creator_.value()(
-            [&, signature](std::unique_ptr<Batch<BatchingSessionTask>> batch) {
-              ProcessBatch(signature, std::move(batch));
-            },
-            &batch_scheduler));
-        custom_signature_batch_schedulers_[signature] =
-            std::move(batch_scheduler);
-        batch_scheduler_it = custom_signature_batch_schedulers_.find(signature);
-      }
-    } else {
-      // We have a Run() call that doesn't match one of our batching signatures.
-      // Run it in-line.
-      LOG_EVERY_N_SEC(WARNING, 120)
-          << "Request doesn't match any declared signature and no default "
-             "scheduler creator specified. Bypassing "
-             "batcher. Request signature is: "
-          << TensorSignatureDebugString(signature);
+  BatchScheduler<BatchingSessionTask>* batch_scheduler;
+  TF_RETURN_IF_ERROR(FindOrCreateBatchScheduler(signature, &batch_scheduler));
+  if (batch_scheduler == nullptr) {
+    // We have a Run() call that doesn't match one of our batching signatures.
+    // Run it in-line.
+    LOG_EVERY_N_SEC(WARNING, 120)
+        << "Request doesn't match any declared signature and no default "
+           "scheduler creator specified. Bypassing "
+           "batcher. Request signature is: "
+        << TensorSignatureDebugString(signature);
 
-      // Because the wrapped session may not provide an implementation for
-      // thread_pool_options, we need to invoke different Run() functions
-      // depending on whether thread_pool_options is specified.
-      if (thread_pool_options) {
-        return wrapped_->Run(run_options, inputs, output_tensor_names,
-                             target_node_names, outputs, run_metadata,
-                             thread_pool_options.value());
-      } else {
-        return wrapped_->Run(run_options, inputs, output_tensor_names,
-                             target_node_names, outputs, run_metadata);
-      }
+    // Because the wrapped session may not provide an implementation for
+    // thread_pool_options, we need to invoke different Run() functions
+    // depending on whether thread_pool_options is specified.
+    if (thread_pool_options) {
+      return wrapped_->Run(run_options, inputs, output_tensor_names,
+                           target_node_names, outputs, run_metadata,
+                           thread_pool_options.value());
+    } else {
+      return wrapped_->Run(run_options, inputs, output_tensor_names,
+                           target_node_names, outputs, run_metadata);
     }
   }
-  BatchScheduler<BatchingSessionTask>* batch_scheduler =
-      batch_scheduler_it->second.get();
 
   outputs->clear();
 
@@ -455,6 +487,50 @@ absl::Status BatchingSession::InternalRun(
   TF_RETURN_IF_ERROR(batch_scheduler->Schedule(&task));
   done.WaitForNotification();
   return status;
+}
+
+absl::Status BatchingSession::RunAsync(
+    const RunOptions& run_options,
+    const std::vector<std::pair<string, Tensor>>* inputs,
+    const std::vector<string>* output_tensor_names,
+    std::vector<Tensor>* outputs, RunMetadata* run_metadata,
+    const thread::ThreadPoolOptions& thread_pool_options, absl::Status* status,
+    std::function<void()> done) {
+  tsl::profiler::TraceMe trace_me([this] {
+    return tsl::profiler::TraceMeEncode(
+        "BatchingSessionRunAsync",
+        {{"thread_pool_name", thread_pool_name_}, {"_r", 1} /*root_event*/});
+  });
+  const TensorSignature signature =
+      TensorSignatureFromRunArgs(*inputs, *output_tensor_names);
+  BatchScheduler<BatchingSessionTask>* batch_scheduler;
+  TF_RETURN_IF_ERROR(FindOrCreateBatchScheduler(signature, &batch_scheduler));
+  if (batch_scheduler == nullptr) {
+    return errors::Unimplemented(
+        "Request doesn't match any declared signature and no default "
+        "scheduler creator specified. Request signature is: ",
+        TensorSignatureDebugString(signature));
+  }
+
+  outputs->clear();
+
+  auto task = std::unique_ptr<BatchingSessionTask>(new BatchingSessionTask);
+  task->enqueue_time_micros = EnvTime::NowMicros();
+  task->run_options = run_options;
+  TF_RETURN_IF_ERROR(ComputeInputSize(*inputs, &task->zeroth_dim_size));
+  task->inputs = inputs;
+  task->output_tensor_names = output_tensor_names;
+  task->done = nullptr;
+  task->async_done = std::move(done);
+  task->status = status;
+  task->outputs = outputs;
+  task->run_metadata = run_metadata;
+  task->thread_pool_options = thread_pool_options;
+  task->thread_safe_status = std::make_shared<ThreadSafeStatus>();
+  task->shared_outputs = std::make_shared<std::vector<std::vector<Tensor>>>();
+  task->split_run_metadatas = absl::make_unique<std::vector<RunMetadata>>();
+
+  return batch_scheduler->Schedule(&task);
 }
 
 absl::Status BatchingSession::ListDevices(
@@ -738,7 +814,11 @@ void BatchingSession::ProcessBatch(
         task->done_callback();
       } else {
         *batch->mutable_task(i)->status = status;
-        batch->mutable_task(i)->done->Notify();
+        if (task->async_done) {
+          task->async_done();
+        } else {
+          batch->mutable_task(i)->done->Notify();
+        }
       }
     }
   });
@@ -833,6 +913,7 @@ absl::Status SplitInputTask(
   // `split_task_done_callback` runs only after all split tasks are complete.
   std::function<void()> split_task_done_callback =
       [done_notification = input_task.done,
+       async_done = input_task.async_done,
        shared_outputs = input_task.shared_outputs,
        shared_status = input_task.thread_safe_status,
        num_output = input_task.output_tensor_names->size(),
@@ -841,7 +922,11 @@ absl::Status SplitInputTask(
        split_run_metadatas = input_task.split_run_metadatas]() {
         auto finally = gtl::MakeCleanup([&] {
           *status = shared_status->status();
-          done_notification->Notify();
+          if (async_done) {
+            async_done();
+          } else {
+            done_notification->Notify();
+          }
         });
 
         // Some slices of tasks encounter errors, return early without

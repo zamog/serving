@@ -63,6 +63,20 @@ cc_library(
 )
 
 cc_library(
+    name = "async_run_session",
+    hdrs = ["async_run_session.h"],
+    visibility = [
+        "//visibility:public",
+    ],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@org_tensorflow//tensorflow/core:framework",
+        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core:protos_all_cc",
+    ],
+)
+
+cc_library(
     name = "batching_session",
     srcs = ["batching_session.cc"],
     hdrs = ["batching_session.h"],
@@ -70,6 +84,7 @@ cc_library(
         "//visibility:public",
     ],
     deps = [
+        ":async_run_session",
         ":batching_options",
         ":batching_util",
         ":incremental_barrier",
@@ -113,6 +128,7 @@ cc_test(
         "@org_tensorflow//tensorflow/cc/saved_model:saved_model_half_plus_two",
     ],
     deps = [
+        ":async_run_session",
         ":batching_session",
         "//tensorflow_serving/core/test_util:test_main",
         "//tensorflow_serving/servables/tensorflow:serving_session",

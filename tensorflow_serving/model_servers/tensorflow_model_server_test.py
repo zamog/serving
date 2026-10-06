@@ -42,12 +42,14 @@ import tensorflow.compat.v1 as tf
 
 from tensorflow.python.platform import flags
 from tensorflow.python.profiler import profiler_client
+from tensorflow.core.framework import types_pb2
 from tensorflow.python.saved_model import signature_constants
 from tensorflow_serving.apis import classification_pb2
 from tensorflow_serving.apis import get_model_metadata_pb2
 from tensorflow_serving.apis import get_model_status_pb2
 from tensorflow_serving.apis import inference_pb2
 from tensorflow_serving.apis import model_service_pb2_grpc
+from tensorflow_serving.apis import predict_pb2
 from tensorflow_serving.apis import prediction_service_pb2_grpc
 from tensorflow_serving.apis import regression_pb2
 from tensorflow_serving.model_servers.test_util import tensorflow_model_server_test_base
@@ -486,6 +488,120 @@ class TensorflowModelServerTest(
         'server_options.grpc_num_completion_queues (4) * '
         'server_options.grpc_min_pollers (4) = 16 polling threads, which '
         'exceeds server_options.grpc_max_threads (8)')
+    error_message = error_message.encode('utf-8')
+    self.assertNotEqual(proc.stderr, None)
+    self.assertGreater(proc.stderr.read().find(error_message), -1)
+
+  def testGrpcAsyncPredictWithBatching(self):
+    """Test asynchronous Predict through the batching session."""
+    model_path = self._GetSavedModelBundlePath()
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        model_path,
+        batching_parameters_file=self._GetBatchingParametersFile(),
+        grpc_async_predict=True,
+        grpc_async_predict_threads=2)[1]
+    expected_version = self._GetModelVersion(model_path)
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        expected_version=expected_version)
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        specify_output=False,
+        expected_version=expected_version)
+
+  def testGrpcAsyncPredictWithoutBatching(self):
+    """Test asynchronous Predict with a session that runs synchronously."""
+    model_path = self._GetSavedModelBundlePath()
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default', model_path, grpc_async_predict=True)[1]
+    self.VerifyPredictRequest(
+        model_server_address,
+        expected_output=3.0,
+        expected_version=self._GetModelVersion(model_path))
+
+  def testGrpcAsyncPredictConcurrentRequests(self):
+    """Test concurrent asynchronous Predict calls each get their own result."""
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        batching_parameters_file=self._GetBatchingParametersFile(),
+        grpc_async_predict=True,
+        grpc_async_predict_threads=2)[1]
+    channel = grpc.insecure_channel(model_server_address)
+    stub = prediction_service_pb2_grpc.PredictionServiceStub(channel)
+
+    def StartPredict(x):
+      request = predict_pb2.PredictRequest()
+      request.model_spec.name = 'default'
+      request.inputs['x'].dtype = types_pb2.DT_FLOAT
+      request.inputs['x'].float_val.append(x)
+      request.inputs['x'].tensor_shape.dim.add().size = 1
+      return stub.Predict.future(request, RPC_TIMEOUT)
+
+    calls = [(x, StartPredict(float(x))) for x in range(200)]
+    for x, call in calls:
+      result = call.result()
+      self.assertEqual(1, len(result.outputs['y'].float_val))
+      # The model computes y = x / 2 + 2.
+      self.assertEqual(x / 2.0 + 2.0, result.outputs['y'].float_val[0])
+
+  def testGrpcAsyncPredictFreesQueueThreadWhileBatching(self):
+    """Test a Predict waiting for its batch does not hold its queue thread."""
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        batching_parameters_file=self._GetLongTimeoutBatchingParametersFile(),
+        grpc_async_predict=True,
+        grpc_async_predict_threads=1)[1]
+    channel = grpc.insecure_channel(model_server_address)
+    stub = prediction_service_pb2_grpc.PredictionServiceStub(channel)
+    request = predict_pb2.PredictRequest()
+    request.model_spec.name = 'default'
+    request.inputs['x'].dtype = types_pb2.DT_FLOAT
+    request.inputs['x'].float_val.append(2.0)
+    request.inputs['x'].tensor_shape.dim.add().size = 1
+
+    # A batch runs once it holds two requests, or after 60 s. The only queue
+    # thread must take the second request while the first waits in the batch;
+    # a thread blocked on the first would leave both to miss their deadline.
+    calls = [stub.Predict.future(request, RPC_TIMEOUT) for _ in range(2)]
+    for call in calls:
+      self.assertEqual(3.0, call.result().outputs['y'].float_val[0])
+
+  def testGrpcAsyncPredictKeepsOtherMethods(self):
+    """Test the other PredictionService methods with asynchronous Predict."""
+    model_path = self._GetSavedModelBundlePath()
+    model_server_address = TensorflowModelServerTest.RunServer(
+        'default',
+        model_path,
+        batching_parameters_file=self._GetBatchingParametersFile(),
+        grpc_async_predict=True)[1]
+    request = regression_pb2.RegressionRequest()
+    request.model_spec.name = 'default'
+    request.model_spec.signature_name = 'regress_x_to_y'
+    example = request.input.example_list.examples.add()
+    example.features.feature['x'].float_list.value.extend([2.0])
+    channel = grpc.insecure_channel(model_server_address)
+    stub = prediction_service_pb2_grpc.PredictionServiceStub(channel)
+    result = stub.Regress(request, RPC_TIMEOUT)
+    self.assertEqual(1, len(result.result.regressions))
+    self.assertEqual(3.0, result.result.regressions[0].value)
+
+  def testBadGrpcAsyncPredictThreads(self):
+    """Test server fails when grpc_async_predict_threads is negative."""
+    proc = TensorflowModelServerTest.RunServer(
+        'default',
+        self._GetSavedModelBundlePath(),
+        grpc_async_predict=True,
+        grpc_async_predict_threads=-1,
+        pipe=subprocess.PIPE,
+        wait_for_server_ready=False)[0]
+
+    error_message = (
+        'server_options.grpc_async_predict_threads (-1) must not be negative.')
     error_message = error_message.encode('utf-8')
     self.assertNotEqual(proc.stderr, None)
     self.assertGreater(proc.stderr.read().find(error_message), -1)

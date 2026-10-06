@@ -194,5 +194,6 @@ exports_files([
     "good_model_config.txt",
     "bad_model_config.txt",
     "batching_config.txt",
+    "batching_config_long_timeout.txt",
     "monitoring_config.txt",
 ])

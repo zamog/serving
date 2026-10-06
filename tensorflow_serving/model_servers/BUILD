@@ -237,6 +237,20 @@ cc_library(
 )
 
 cc_library(
+    name = "async_predict_server",
+    srcs = ["async_predict_server.cc"],
+    hdrs = ["async_predict_server.h"],
+    deps = [
+        ":prediction_service_impl",
+        "//tensorflow_serving/apis:predict_cc_proto",
+        "//tensorflow_serving/apis:prediction_service_cc_proto",
+        "//tensorflow_serving/servables/tensorflow:predict_impl",
+        "@com_github_grpc_grpc//:grpc++",
+        "@org_tensorflow//tensorflow/core:lib",
+    ],
+)
+
+cc_library(
     name = "prediction_service_impl",
     srcs = ["prediction_service_impl.cc"],
     hdrs = ["prediction_service_impl.h"],
@@ -481,6 +495,7 @@ cc_library(
     hdrs = ["server.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":async_predict_server",
         ":grpc_status_util",
         ":http_server",
         ":model_platform_types",
@@ -578,6 +593,7 @@ py_test(
         "//tensorflow_serving/servables/tensorflow/testdata:bad_half_plus_two/00000123/export.meta",
         "//tensorflow_serving/servables/tensorflow/testdata:bad_model_config.txt",
         "//tensorflow_serving/servables/tensorflow/testdata:batching_config.txt",
+        "//tensorflow_serving/servables/tensorflow/testdata:batching_config_long_timeout.txt",
         "//tensorflow_serving/servables/tensorflow/testdata:good_model_config.txt",
         "//tensorflow_serving/servables/tensorflow/testdata:half_plus_two_model_metadata.json",
         "//tensorflow_serving/servables/tensorflow/testdata:monitoring_config.txt",

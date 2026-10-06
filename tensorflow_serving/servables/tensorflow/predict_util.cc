@@ -75,12 +75,13 @@ absl::Status VerifyRequestInputsSize(const SignatureDef& signature,
 }  // namespace
 
 namespace internal {
-absl::Status RunPredict(
-    const RunOptions& run_options, const MetaGraphDef& meta_graph_def,
+absl::Status PrepareRunPredict(
+    const MetaGraphDef& meta_graph_def,
     const absl::optional<int64_t>& servable_version,
-    const internal::PredictResponseTensorSerializationOption option,
-    Session* session, const PredictRequest& request, PredictResponse* response,
-    const thread::ThreadPoolOptions& thread_pool_options) {
+    const PredictRequest& request, PredictResponse* response,
+    std::vector<std::pair<string, Tensor>>* input_tensors,
+    std::vector<string>* output_tensor_names,
+    std::vector<string>* output_tensor_aliases) {
   // Validate signatures.
   const string signature_name = request.model_spec().signature_name().empty()
                                     ? kDefaultServingSignatureDefKey
@@ -95,12 +96,23 @@ absl::Status RunPredict(
   MakeModelSpec(request.model_spec().name(), signature_name, servable_version,
                 response->mutable_model_spec());
 
+  return PreProcessPrediction(signature, request, input_tensors,
+                              output_tensor_names, output_tensor_aliases);
+}
+
+absl::Status RunPredict(
+    const RunOptions& run_options, const MetaGraphDef& meta_graph_def,
+    const absl::optional<int64_t>& servable_version,
+    const internal::PredictResponseTensorSerializationOption option,
+    Session* session, const PredictRequest& request, PredictResponse* response,
+    const thread::ThreadPoolOptions& thread_pool_options) {
   std::vector<std::pair<string, Tensor>> input_tensors;
   std::vector<string> output_tensor_names;
   std::vector<string> output_tensor_aliases;
-  TF_RETURN_IF_ERROR(PreProcessPrediction(signature, request, &input_tensors,
-                                          &output_tensor_names,
-                                          &output_tensor_aliases));
+  TF_RETURN_IF_ERROR(PrepareRunPredict(meta_graph_def, servable_version,
+                                       request, response, &input_tensors,
+                                       &output_tensor_names,
+                                       &output_tensor_aliases));
   std::vector<Tensor> outputs;
   RunMetadata run_metadata;
   const uint64_t start_microseconds = EnvTime::NowMicros();

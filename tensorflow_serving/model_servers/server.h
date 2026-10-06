@@ -24,6 +24,7 @@ limitations under the License.
 #include "tensorflow/core/platform/cpu_info.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/profiler/rpc/profiler_service_impl.h"
+#include "tensorflow_serving/model_servers/async_predict_server.h"
 #include "tensorflow_serving/model_servers/http_server.h"
 #include "tensorflow_serving/model_servers/model_service_impl.h"
 #include "tensorflow_serving/model_servers/prediction_service_impl.h"
@@ -49,6 +50,12 @@ class Server {
     tensorflow::int32 grpc_num_completion_queues = 0;
     tensorflow::int32 grpc_min_pollers = 0;
     tensorflow::int32 grpc_max_pollers = 0;
+    // Serve Predict through gRPC's asynchronous API (AsyncPredictServer), so
+    // that a request waiting for its batch does not hold a gRPC thread.
+    bool grpc_async_predict = false;
+    // Completion queues, each with its own thread, serving asynchronous
+    // Predict calls. Zero means one per schedulable CPU.
+    tensorflow::int32 grpc_async_predict_threads = 0;
 
     //
     // HTTP Server options.
@@ -135,6 +142,11 @@ class Server {
   std::unique_ptr<ServerCore> server_core_;
   std::unique_ptr<ModelServiceImpl> model_service_;
   std::unique_ptr<PredictionService::Service> prediction_service_;
+  // Set when Predict is served asynchronously. Declared before grpc_server_
+  // so that they are destroyed after it, as gRPC requires of services and
+  // completion queues.
+  std::unique_ptr<AsyncPredictionService> async_prediction_service_;
+  std::unique_ptr<AsyncPredictServer> async_predict_server_;
   std::unique_ptr<tensorflow::grpc::ProfilerService::Service> profiler_service_;
   std::unique_ptr<::grpc::Server> grpc_server_;
   std::unique_ptr<net_http::HTTPServerInterface> http_server_;

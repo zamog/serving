@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "google/protobuf/wrappers.pb.h"
 #include "grpc/grpc.h"
+#include "grpcpp/completion_queue.h"
 #include "grpcpp/health_check_service_interface.h"
 #include "grpcpp/resource_quota.h"
 #include "grpcpp/security/server_credentials.h"
@@ -165,6 +166,11 @@ Server::~Server() {
   // until the thread has terminated.
   fs_config_polling_thread_.reset();
   WaitForTermination();
+  if (async_predict_server_ != nullptr) {
+    // The gRPC server has shut down: drain its completion queues before it is
+    // destroyed.
+    async_predict_server_->Stop();
+  }
 }
 
 void Server::PollFilesystemAndReloadConfig(const string& config_file_path) {
@@ -245,6 +251,12 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
         server_options.grpc_max_threads,
         "). gRPC reserves these threads from the server's thread quota up "
         "front and aborts the process if the reservation fails.");
+  }
+
+  if (server_options.grpc_async_predict_threads < 0) {
+    return errors::InvalidArgument(
+        "server_options.grpc_async_predict_threads (",
+        server_options.grpc_async_predict_threads, ") must not be negative.");
   }
 
   if (server_options.use_alts_credentials &&
@@ -430,6 +442,18 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
   predict_server_options.thread_pool_factory = thread_pool_factory_.get();
   prediction_service_ =
       tf_serving_registry->GetCreatePredictionService()(predict_server_options);
+  if (server_options.grpc_async_predict) {
+    auto* prediction_service_impl =
+        dynamic_cast<PredictionServiceImpl*>(prediction_service_.get());
+    if (prediction_service_impl == nullptr) {
+      return errors::InvalidArgument(
+          "server_options.grpc_async_predict needs the built-in "
+          "PredictionServiceImpl, but a different prediction service is "
+          "registered.");
+    }
+    async_prediction_service_ =
+        absl::make_unique<AsyncPredictionService>(prediction_service_impl);
+  }
 
   ::grpc::ServerBuilder builder;
   // If defined, listen to a tcp port for gRPC/HTTP.
@@ -448,7 +472,11 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
                                server_options.ssl_config_file));
   }
   builder.RegisterService(model_service_.get());
-  builder.RegisterService(prediction_service_.get());
+  if (async_prediction_service_ != nullptr) {
+    builder.RegisterService(async_prediction_service_.get());
+  } else {
+    builder.RegisterService(prediction_service_.get());
+  }
   if (server_options.enable_profiler) {
     profiler_service_ = tensorflow::profiler::CreateProfilerService();
     builder.RegisterService(profiler_service_.get());
@@ -506,10 +534,27 @@ absl::Status Server::BuildAndStart(const Options& server_options) {
   builder.SetResourceQuota(res_quota);
   ::grpc::EnableDefaultHealthCheckService(
       server_options.enable_grpc_healthcheck_service);
+  const int num_async_predict_queues =
+      server_options.grpc_async_predict_threads > 0
+          ? server_options.grpc_async_predict_threads
+          : port::NumSchedulableCPUs();
+  if (async_prediction_service_ != nullptr) {
+    std::vector<std::unique_ptr<::grpc::ServerCompletionQueue>> queues;
+    for (int i = 0; i < num_async_predict_queues; ++i) {
+      queues.push_back(builder.AddCompletionQueue());
+    }
+    async_predict_server_ = absl::make_unique<AsyncPredictServer>(
+        async_prediction_service_.get(), std::move(queues));
+  }
   grpc_server_ = builder.BuildAndStart();
 
   if (grpc_server_ == nullptr) {
     return errors::InvalidArgument("Failed to BuildAndStart gRPC server");
+  }
+  if (async_predict_server_ != nullptr) {
+    async_predict_server_->Start();
+    LOG(INFO) << "Serving Predict asynchronously on "
+              << num_async_predict_queues << " gRPC completion queues";
   }
 
   if (server_options.enable_grpc_healthcheck_service) {

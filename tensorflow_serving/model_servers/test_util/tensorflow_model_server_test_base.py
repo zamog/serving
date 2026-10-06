@@ -157,6 +157,8 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       grpc_num_completion_queues=None,
       grpc_min_pollers=None,
       grpc_max_pollers=None,
+      grpc_async_predict=None,
+      grpc_async_predict_threads=None,
       wait_for_server_ready=True,
       pipe=None,
       model_config_file_poll_period=None,
@@ -180,6 +182,9 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
       grpc_num_completion_queues: Number of gRPC sync server completion queues.
       grpc_min_pollers: Minimum number of gRPC sync server polling threads.
       grpc_max_pollers: Maximum number of gRPC sync server polling threads.
+      grpc_async_predict: Serve Predict through gRPC's asynchronous API.
+      grpc_async_predict_threads: Completion queues serving asynchronous
+        Predict.
       wait_for_server_ready: Wait for gRPC port to be ready.
       pipe: subpipe.PIPE object to read stderr from server.
       model_config_file_poll_period: Period for polling the filesystem to
@@ -242,6 +247,13 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
 
     if grpc_max_pollers is not None:
       command += ' --grpc_max_pollers=' + str(grpc_max_pollers)
+
+    if grpc_async_predict is not None:
+      command += ' --grpc_async_predict=' + str(grpc_async_predict).lower()
+
+    if grpc_async_predict_threads is not None:
+      command += ' --grpc_async_predict_threads=' + str(
+          grpc_async_predict_threads)
 
     if grpc_channel_arguments:
       command += ' --grpc_channel_arguments=' + grpc_channel_arguments
@@ -350,6 +362,10 @@ class TensorflowModelServerTestBase(tf.test.TestCase):
   def _GetBatchingParametersFile(self):
     """Returns a path to a batching configuration file."""
     return os.path.join(self.testdata_dir, 'batching_config.txt')
+
+  def _GetLongTimeoutBatchingParametersFile(self):
+    """Returns a path to a batching config whose batches run only when full."""
+    return os.path.join(self.testdata_dir, 'batching_config_long_timeout.txt')
 
   def _GetModelMetadataFile(self):
     """Returns a path to a sample model metadata file."""

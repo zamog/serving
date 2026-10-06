@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef TENSORFLOW_SERVING_MODEL_SERVERS_PREDICTION_SERVICE_IMPL_H_
 #define TENSORFLOW_SERVING_MODEL_SERVERS_PREDICTION_SERVICE_IMPL_H_
 
+#include <functional>
+
 #include "tensorflow_serving/apis/prediction_service.grpc.pb.h"
 #include "tensorflow_serving/model_servers/prediction_service_util.h"
 #include "tensorflow_serving/servables/tensorflow/predict_impl.h"
@@ -34,6 +36,15 @@ class PredictionServiceImpl final : public PredictionService::Service {
   ::grpc::Status Predict(::grpc::ServerContext* context,
                          const PredictRequest* request,
                          PredictResponse* response) override;
+
+  // Predict() for gRPC's asynchronous API: starts the prediction and returns.
+  // 'done' gets the status Predict() would return, once 'response' is filled
+  // in; see TensorflowPredictor::PredictAsync() for the threads it runs on and
+  // how long 'context', 'request', 'response' and 'state' must stay alive.
+  void PredictAsync(::grpc::ServerContext* context,
+                    const PredictRequest* request, PredictResponse* response,
+                    PredictAsyncState* state,
+                    std::function<void(const ::grpc::Status&)> done);
 
   ::grpc::Status GetModelMetadata(::grpc::ServerContext* context,
                                   const GetModelMetadataRequest* request,

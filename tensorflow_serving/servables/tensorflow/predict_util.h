@@ -40,6 +40,17 @@ Status RunPredict(
     const thread::ThreadPoolOptions& thread_pool_options =
         thread::ThreadPoolOptions());
 
+// The part of RunPredict() that precedes the session run: finds the request's
+// signature in 'meta_graph_def', fills in the response's model spec, and
+// converts the request into the session's inputs and output names.
+Status PrepareRunPredict(const MetaGraphDef& meta_graph_def,
+                         const absl::optional<int64_t>& servable_version,
+                         const PredictRequest& request,
+                         PredictResponse* response,
+                         std::vector<std::pair<string, Tensor>>* input_tensors,
+                         std::vector<string>* output_tensor_names,
+                         std::vector<string>* output_tensor_aliases);
+
 // Validate a SignatureDef to make sure it's compatible with prediction, and
 // if so, populate the input and output tensor names.
 Status PreProcessPrediction(const SignatureDef& signature,

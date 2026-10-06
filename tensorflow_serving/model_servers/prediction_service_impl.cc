@@ -61,6 +61,33 @@ ScopedThreadPools GetThreadPools(ThreadPoolFactory *thread_pool_factory) {
   return status;
 }
 
+void PredictionServiceImpl::PredictAsync(
+    ::grpc::ServerContext *context, const PredictRequest *request,
+    PredictResponse *response, PredictAsyncState *state,
+    std::function<void(const ::grpc::Status &)> done) {
+  const uint64_t start = Env::Default()->NowMicros();
+  tensorflow::RunOptions run_options = tensorflow::RunOptions();
+  if (enforce_session_run_timeout_) {
+    run_options.set_timeout_in_ms(
+        DeadlineToTimeoutMillis(context->raw_deadline()));
+  }
+
+  predictor_->PredictAsync(
+      run_options, core_, *request, response, state,
+      [start, request, done = std::move(done)](const Status &tf_status) {
+        const ::grpc::Status status = ToGRPCStatus(tf_status);
+        if (status.ok()) {
+          RecordRequestLatency(request->model_spec().name(), /*api=*/"Predict",
+                               /*entrypoint=*/"GRPC",
+                               Env::Default()->NowMicros() - start);
+        } else {
+          VLOG(1) << "Predict failed: " << status.error_message();
+        }
+        RecordModelRequestCount(request->model_spec().name(), tf_status);
+        done(status);
+      });
+}
+
 ::grpc::Status PredictionServiceImpl::GetModelMetadata(
     ::grpc::ServerContext *context, const GetModelMetadataRequest *request,
     GetModelMetadataResponse *response) {

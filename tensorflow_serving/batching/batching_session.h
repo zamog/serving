@@ -181,6 +181,9 @@ struct BatchingSessionTask : public BatchTask {
   // Fields populated when a task is processed (as part of a batch), and
   // returned by BatchingSession when a task is complete.
   Notification* done;
+  // Set by BatchingSession::RunAsync(): called on the batch thread instead of
+  // done->Notify(), once 'status' (and on success 'outputs') are written.
+  std::function<void()> async_done;
   Status* status;
   std::vector<Tensor>* outputs;
   RunMetadata* run_metadata;

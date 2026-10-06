@@ -50,6 +50,7 @@ limitations under the License.
 #include "tensorflow/compiler/jit/flags.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/init_main.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/util/command_line_flags.h"
 #include "tensorflow_serving/model_servers/server.h"
 #include "tensorflow_serving/model_servers/version.h"
@@ -259,6 +260,22 @@ int main(int argc, char** argv) {
                        "server keeps per completion queue. Must not be less "
                        "than grpc_min_pollers. If zero, the grpc default (2) "
                        "is used."),
+      tensorflow::Flag("grpc_async_predict", &options.grpc_async_predict,
+                       "Serve Predict through gRPC's asynchronous API. A "
+                       "synchronous handler holds its gRPC thread until the "
+                       "request's batch has run, so the server needs one "
+                       "thread per request in flight; asynchronously, a "
+                       "request waiting for its batch holds no thread. The "
+                       "other PredictionService methods stay synchronous. "
+                       "Meant for models with batching: a Predict on a model "
+                       "without it runs synchronously on a "
+                       "grpc_async_predict_threads thread, and these threads "
+                       "also do all of the server's gRPC network I/O."),
+      tensorflow::Flag("grpc_async_predict_threads",
+                       &options.grpc_async_predict_threads,
+                       "With --grpc_async_predict, the number of gRPC "
+                       "completion queues serving Predict, each drained by "
+                       "its own thread. If zero, one per schedulable CPU."),
       tensorflow::Flag("enable_model_warmup", &options.enable_model_warmup,
                        "Enables model warmup, which triggers lazy "
                        "initializations (such as TF optimizations) at load "
@@ -358,6 +375,8 @@ int main(int argc, char** argv) {
   tensorflow::serving::main::Server server;
   const auto& status = server.BuildAndStart(options);
   if (!status.ok()) {
+    // Also log it: stdout is often not collected, and the tests read stderr.
+    LOG(ERROR) << "Failed to start server. Error: " << status;
     std::cout << "Failed to start server. Error: " << status << "\n";
     return -1;
   }
